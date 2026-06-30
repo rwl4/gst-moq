@@ -1,0 +1,5 @@
+/build/
+/test/*.log
+/test/*.pem
+/compile_commands.json
+/.cache/
