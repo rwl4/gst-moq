@@ -53,6 +53,20 @@ target_link_libraries(gstmoq PRIVATE
     moq::msf
     moq::core)
 
+# An installed picoquic exports picoquic-core without chaining picoquic-log,
+# yet picoquic-core references picoquic_set_qlog from it (and picoquic-log's
+# export links back to core). Mirror moq5's source-tree fix-up: hang log off
+# core's link interface so CMake sees the static-archive cycle and repeats
+# the archives in the right order.
+if(TARGET picoquic::picoquic-core AND TARGET picoquic::picoquic-log)
+    get_target_property(_pq_core_libs picoquic::picoquic-core
+        INTERFACE_LINK_LIBRARIES)
+    if(NOT _pq_core_libs OR NOT "picoquic::picoquic-log" IN_LIST _pq_core_libs)
+        set_property(TARGET picoquic::picoquic-core APPEND PROPERTY
+            INTERFACE_LINK_LIBRARIES picoquic::picoquic-log)
+    endif()
+endif()
+
 target_compile_options(gstmoq PRIVATE -Wall -Wextra)
 
 # GStreamer discovers plugins by scanning a directory for libgst*.so;
