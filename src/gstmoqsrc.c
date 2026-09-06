@@ -98,13 +98,19 @@ struct _GstMoqSrc
   guint64 objects_recv;
 
   /* wanted-track descriptor snapshot (valid while the receiver lives) */
-  moq_media_packaging_t want_packaging;
   moq_bytes_t           want_init;      /* CMAF init segment from the catalog */
   gboolean              init_pushed;
   GstBuffer            *pending;        /* fragment held back behind the init */
   GString              *seen_tracks;    /* names announced, for error text */
   gint64                discover_deadline;
   guint                 discovery_timeout_ms;
+  GstCaps              *derived_caps;   /* caps inferred from the catalog when
+                                            the "caps" property is unset; never
+                                            written into self->caps */
+  gboolean              negotiation_failed; /* latched CORE/NEGOTIATION error */
+  gboolean              track_ever_seen;    /* wanted track announced at least
+                                                once; suppresses discovery-timeout
+                                                after a later TRACK_REMOVED */
 
   /* timestamp anchor: first object's LOC time -> pipeline running time */
   gboolean     have_anchor;
@@ -173,11 +179,17 @@ gst_moq_src_start (GstBaseSrc *bsrc)
   self->catalog_ready = FALSE;
   self->objects_recv = 0;
   self->have_anchor = FALSE;
-  self->want_packaging = 0;
   self->want_init = (moq_bytes_t) {0};
   self->init_pushed = FALSE;
-  self->pending = NULL;
+  g_clear_pointer (&self->pending, gst_buffer_unref);
+  if (self->seen_tracks) {
+    g_string_free (self->seen_tracks, TRUE);
+    self->seen_tracks = NULL;
+  }
   self->seen_tracks = g_string_new (NULL);
+  gst_caps_replace (&self->derived_caps, NULL);
+  self->negotiation_failed = FALSE;
+  self->track_ever_seen = FALSE;
   self->discover_deadline = g_get_monotonic_time () +
       (gint64) self->discovery_timeout_ms * 1000;
 
@@ -235,6 +247,12 @@ fail_ns:
   g_clear_pointer (&self->ns_tokens, g_strfreev);
   g_clear_pointer (&self->ns_bytes, g_free);
   self->ns_count = 0;
+  g_clear_pointer (&self->pending, gst_buffer_unref);
+  if (self->seen_tracks) {
+    g_string_free (self->seen_tracks, TRUE);
+    self->seen_tracks = NULL;
+  }
+  gst_caps_replace (&self->derived_caps, NULL);
   return FALSE;
 }
 
@@ -270,6 +288,7 @@ gst_moq_src_stop (GstBaseSrc *bsrc)
     g_string_free (self->seen_tracks, TRUE);
     self->seen_tracks = NULL;
   }
+  gst_caps_replace (&self->derived_caps, NULL);
 
   GST_INFO_OBJECT (self, "stopped (received %" G_GUINT64_FORMAT " objects)",
       self->objects_recv);
@@ -348,11 +367,11 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
         const moq_media_track_desc_t *d = ev.desc;
         GST_INFO_OBJECT (self, "TRACK_ADDED name=%.*s codec=%.*s packaging=%s",
             d ? (int) d->name.len : 0,
-            d && d->name.data ? (const char *) d->name.data : "",
+            d ? (const char *) d->name.data : "",
             d ? (int) d->codec.len : 0,
-            d && d->codec.data ? (const char *) d->codec.data : "",
+            d ? (const char *) d->codec.data : "",
             d && d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF ? "cmaf" : "loc");
-        if (d && self->seen_tracks) {
+        if (d && self->seen_tracks && !self->want_track) {
           if (self->seen_tracks->len)
             g_string_append (self->seen_tracks, ", ");
           g_string_append_len (self->seen_tracks, (const gchar *) d->name.data,
@@ -361,7 +380,7 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
         if (d && d->name.len == strlen (self->track_name) &&
             memcmp (d->name.data, self->track_name, d->name.len) == 0) {
           self->want_track = ev.track;
-          self->want_packaging = d->info.packaging;
+          self->track_ever_seen = TRUE;
           self->want_init = d->init_data;
           self->init_pushed = FALSE;
           if (!self->caps || gst_caps_is_any (self->caps)) {
@@ -381,15 +400,25 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
                       "\"caps\" property for it", self->track_name,
                       (int) d->codec.len, (const char *) d->codec.data),
                   (NULL));
+              self->negotiation_failed = TRUE;
             }
             if (c) {
-              gst_caps_replace (&self->caps, c);
+              gst_caps_replace (&self->derived_caps, c);
               gst_caps_unref (c);
             }
           }
         }
         break;
       }
+      case MOQ_MEDIA_TRACK_REMOVED:
+        if (ev.track && ev.track == self->want_track) {
+          GST_INFO_OBJECT (self, "wanted track \"%s\" removed from the catalog",
+              self->track_name);
+          self->want_track = NULL;
+          self->want_init = (moq_bytes_t) {0};
+          self->init_pushed = FALSE;
+        }
+        break;
       case MOQ_MEDIA_CATALOG_READY:
         self->catalog_ready = TRUE;
         GST_INFO_OBJECT (self, "CATALOG_READY");
@@ -414,18 +443,26 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
   for (;;) {
     gst_moq_src_drain_track_events (self);
 
+    if (self->negotiation_failed)
+      return GST_FLOW_ERROR;
+
     if (!self->caps_pushed) {
-      if (self->caps && !gst_caps_is_any (self->caps)) {
-        gst_base_src_set_caps (GST_BASE_SRC (self), self->caps);
+      GstCaps *effective = (self->caps && !gst_caps_is_any (self->caps)) ?
+          self->caps : self->derived_caps;
+      if (effective) {
+        gst_base_src_set_caps (GST_BASE_SRC (self), effective);
         self->caps_pushed = TRUE;
-      } else if (g_get_monotonic_time () >= self->discover_deadline) {
-        GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
-            ("track \"%s\" was not announced within %u ms (catalog tracks: %s)",
-                self->track_name, self->discovery_timeout_ms,
-                self->seen_tracks && self->seen_tracks->len ?
-                self->seen_tracks->str : "none"), (NULL));
-        return GST_FLOW_ERROR;
       }
+    }
+
+    if (!self->want_track && !self->track_ever_seen &&
+        g_get_monotonic_time () >= self->discover_deadline) {
+      GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+          ("track \"%s\" was not announced within %u ms (catalog tracks: %s)",
+              self->track_name, self->discovery_timeout_ms,
+              self->seen_tracks && self->seen_tracks->len ?
+              self->seen_tracks->str : "none"), (NULL));
+      return GST_FLOW_ERROR;
     }
 
     moq_media_object_t obj;
@@ -433,7 +470,11 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
         moq_media_receiver_poll_object (self->receiver, &obj, sizeof (obj));
 
     if (rc == MOQ_OK) {
-      if (self->want_track && obj.track != self->want_track) {
+      /* Every object's track is announced before it is pollable, so a NULL
+       * want_track here means the requested track-name has not matched
+       * anything yet -- drop until it resolves (or the discovery deadline
+       * fails the pipeline) rather than guessing at an unrelated track. */
+      if (obj.track != self->want_track) {
         moq_media_object_cleanup (&obj);
         continue;
       }
@@ -621,6 +662,7 @@ gst_moq_src_finalize (GObject *object)
   g_free (self->namespace_str);
   g_free (self->track_name);
   gst_caps_replace (&self->caps, NULL);
+  gst_caps_replace (&self->derived_caps, NULL);
   G_OBJECT_CLASS (gst_moq_src_parent_class)->finalize (object);
 }
 
@@ -677,7 +719,8 @@ gst_moq_src_class_init (GstMoqSrcClass *klass)
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_DISCOVERY_TIMEOUT,
       g_param_spec_uint ("discovery-timeout", "Discovery timeout",
-          "Fail if the track is not announced within this many ms",
+          "Fail if the track is not announced within this many ms "
+          "(0 fails immediately)",
           0, 600000, DEFAULT_DISCOVERY_TIMEOUT_MS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
