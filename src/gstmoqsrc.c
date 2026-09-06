@@ -50,6 +50,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_moq_src_debug);
 #define WAIT_TIMEOUT_US    (100 * 1000)
 #define DEFAULT_LATENCY_MS 200
 #define DEFAULT_DRAFT      16            /* browsers (playa) default to draft-16; 0 = offer all */
+#define DEFAULT_DISCOVERY_TIMEOUT_MS 10000
 
 enum
 {
@@ -63,6 +64,7 @@ enum
   PROP_CAPS,
   PROP_LATENCY,
   PROP_DRAFT,
+  PROP_DISCOVERY_TIMEOUT,
 };
 
 struct _GstMoqSrc
@@ -94,6 +96,15 @@ struct _GstMoqSrc
   guint        ns_count;
 
   guint64 objects_recv;
+
+  /* wanted-track descriptor snapshot (valid while the receiver lives) */
+  moq_media_packaging_t want_packaging;
+  moq_bytes_t           want_init;      /* CMAF init segment from the catalog */
+  gboolean              init_pushed;
+  GstBuffer            *pending;        /* fragment held back behind the init */
+  GString              *seen_tracks;    /* names announced, for error text */
+  gint64                discover_deadline;
+  guint                 discovery_timeout_ms;
 
   /* timestamp anchor: first object's LOC time -> pipeline running time */
   gboolean     have_anchor;
@@ -152,12 +163,6 @@ gst_moq_src_start (GstBaseSrc *bsrc)
 {
   GstMoqSrc *self = GST_MOQ_SRC (bsrc);
 
-  if (!self->caps || gst_caps_is_any (self->caps)) {
-    GST_ELEMENT_ERROR (self, CORE, NEGOTIATION,
-        ("the \"caps\" property must be set to the track's media caps"),
-        (NULL));
-    return FALSE;
-  }
   if (!gst_moq_src_build_namespace (self))
     return FALSE;
 
@@ -168,6 +173,13 @@ gst_moq_src_start (GstBaseSrc *bsrc)
   self->catalog_ready = FALSE;
   self->objects_recv = 0;
   self->have_anchor = FALSE;
+  self->want_packaging = 0;
+  self->want_init = (moq_bytes_t) {0};
+  self->init_pushed = FALSE;
+  self->pending = NULL;
+  self->seen_tracks = g_string_new (NULL);
+  self->discover_deadline = g_get_monotonic_time () +
+      (gint64) self->discovery_timeout_ms * 1000;
 
   gchar *url = g_strdup_printf ("https://%s:%u%s", self->host, self->port,
       self->relay_path);
@@ -253,6 +265,12 @@ gst_moq_src_stop (GstBaseSrc *bsrc)
   self->ns_count = 0;
   self->started = FALSE;
 
+  g_clear_pointer (&self->pending, gst_buffer_unref);
+  if (self->seen_tracks) {
+    g_string_free (self->seen_tracks, TRUE);
+    self->seen_tracks = NULL;
+  }
+
   GST_INFO_OBJECT (self, "stopped (received %" G_GUINT64_FORMAT " objects)",
       self->objects_recv);
   return TRUE;
@@ -328,14 +346,48 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
     switch (ev.kind) {
       case MOQ_MEDIA_TRACK_ADDED: {
         const moq_media_track_desc_t *d = ev.desc;
-        GST_INFO_OBJECT (self, "TRACK_ADDED name=%.*s codec=%.*s",
+        GST_INFO_OBJECT (self, "TRACK_ADDED name=%.*s codec=%.*s packaging=%s",
             d ? (int) d->name.len : 0,
             d && d->name.data ? (const char *) d->name.data : "",
             d ? (int) d->codec.len : 0,
-            d && d->codec.data ? (const char *) d->codec.data : "");
+            d && d->codec.data ? (const char *) d->codec.data : "",
+            d && d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF ? "cmaf" : "loc");
+        if (d && self->seen_tracks) {
+          if (self->seen_tracks->len)
+            g_string_append (self->seen_tracks, ", ");
+          g_string_append_len (self->seen_tracks, (const gchar *) d->name.data,
+              d->name.len);
+        }
         if (d && d->name.len == strlen (self->track_name) &&
-            memcmp (d->name.data, self->track_name, d->name.len) == 0)
+            memcmp (d->name.data, self->track_name, d->name.len) == 0) {
           self->want_track = ev.track;
+          self->want_packaging = d->info.packaging;
+          self->want_init = d->init_data;
+          self->init_pushed = FALSE;
+          if (!self->caps || gst_caps_is_any (self->caps)) {
+            GstCaps *c = NULL;
+            if (d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+              c = gst_caps_new_simple ("video/quicktime",
+                  "variant", G_TYPE_STRING, "iso", NULL);
+            } else if (d->codec.len >= 4 &&
+                (memcmp (d->codec.data, "avc1", 4) == 0 ||
+                    memcmp (d->codec.data, "avc3", 4) == 0)) {
+              c = gst_caps_new_simple ("video/x-h264",
+                  "stream-format", G_TYPE_STRING, "byte-stream",
+                  "alignment", G_TYPE_STRING, "au", NULL);
+            } else {
+              GST_ELEMENT_ERROR (self, CORE, NEGOTIATION,
+                  ("track \"%s\" is a LOC track with codec %.*s; set the "
+                      "\"caps\" property for it", self->track_name,
+                      (int) d->codec.len, (const char *) d->codec.data),
+                  (NULL));
+            }
+            if (c) {
+              gst_caps_replace (&self->caps, c);
+              gst_caps_unref (c);
+            }
+          }
+        }
         break;
       }
       case MOQ_MEDIA_CATALOG_READY:
@@ -353,30 +405,86 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
 {
   GstMoqSrc *self = GST_MOQ_SRC (psrc);
 
-  if (!self->caps_pushed) {
-    gst_base_src_set_caps (GST_BASE_SRC (self), self->caps);
-    self->caps_pushed = TRUE;
+  if (self->pending) {                       /* fragment queued behind the init */
+    *out = self->pending;
+    self->pending = NULL;
+    return GST_FLOW_OK;
   }
 
   for (;;) {
-    /* Discovery first: every handle is known before its first object. */
     gst_moq_src_drain_track_events (self);
+
+    if (!self->caps_pushed) {
+      if (self->caps && !gst_caps_is_any (self->caps)) {
+        gst_base_src_set_caps (GST_BASE_SRC (self), self->caps);
+        self->caps_pushed = TRUE;
+      } else if (g_get_monotonic_time () >= self->discover_deadline) {
+        GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+            ("track \"%s\" was not announced within %u ms (catalog tracks: %s)",
+                self->track_name, self->discovery_timeout_ms,
+                self->seen_tracks && self->seen_tracks->len ?
+                self->seen_tracks->str : "none"), (NULL));
+        return GST_FLOW_ERROR;
+      }
+    }
 
     moq_media_object_t obj;
     moq_result_t rc =
         moq_media_receiver_poll_object (self->receiver, &obj, sizeof (obj));
 
     if (rc == MOQ_OK) {
-      /* When track-name resolved to a handle, deliver only that track. */
       if (self->want_track && obj.track != self->want_track) {
         moq_media_object_cleanup (&obj);
         continue;
       }
+      if (!self->caps_pushed) {              /* object before caps: not usable */
+        moq_media_object_cleanup (&obj);
+        continue;
+      }
+
+      GstBuffer *buf;
+      if (obj.packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+        if (obj.fragment.len == 0) {
+          GST_WARNING_OBJECT (self, "CMAF object with empty fragment, skipping");
+          moq_media_object_cleanup (&obj);
+          continue;
+        }
+        buf = gst_buffer_new_memdup (obj.fragment.data, obj.fragment.len);
+        if (!obj.keyframe)
+          GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+        self->objects_recv++;
+        GST_LOG_OBJECT (self, "received CMAF %s fragment (%zu B)",
+            obj.keyframe ? "sync" : "delta", obj.fragment.len);
+        moq_media_object_cleanup (&obj);
+
+        if (!self->init_pushed) {
+          if (self->want_init.len == 0) {
+            gst_buffer_unref (buf);
+            GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+                ("CMAF track \"%s\" has no init segment in the catalog",
+                    self->track_name), (NULL));
+            return GST_FLOW_ERROR;
+          }
+          GstBuffer *init = gst_buffer_new_memdup (self->want_init.data,
+              self->want_init.len);
+          GST_BUFFER_FLAG_SET (init, GST_BUFFER_FLAG_HEADER);
+          self->init_pushed = TRUE;
+          self->pending = buf;               /* delivered on the next create() */
+          GST_INFO_OBJECT (self, "pushing CMAF init segment (%zu B)",
+              self->want_init.len);
+          *out = init;
+          return GST_FLOW_OK;
+        }
+        *out = buf;
+        return GST_FLOW_OK;
+      }
+
+      /* LOC path, unchanged below */
       if (obj.payload.len == 0) {
         moq_media_object_cleanup (&obj);
         continue;
       }
-      GstBuffer *buf = gst_buffer_new_memdup (obj.payload.data, obj.payload.len);
+      buf = gst_buffer_new_memdup (obj.payload.data, obj.payload.len);
       GST_BUFFER_PTS (buf) = gst_moq_src_map_pts (self, obj.presentation_time_us);
       if (!obj.keyframe)
         GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
@@ -455,6 +563,9 @@ gst_moq_src_set_property (GObject *object, guint prop_id,
     case PROP_DRAFT:
       self->draft = g_value_get_uint (value);
       break;
+    case PROP_DISCOVERY_TIMEOUT:
+      self->discovery_timeout_ms = g_value_get_uint (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -492,6 +603,9 @@ gst_moq_src_get_property (GObject *object, guint prop_id,
       break;
     case PROP_DRAFT:
       g_value_set_uint (value, self->draft);
+      break;
+    case PROP_DISCOVERY_TIMEOUT:
+      g_value_set_uint (value, self->discovery_timeout_ms);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -548,7 +662,8 @@ gst_moq_src_class_init (GstMoqSrcClass *klass)
           DEFAULT_TRACK_NAME, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_CAPS,
       g_param_spec_boxed ("caps", "Caps",
-          "Output caps describing the subscribed track's media",
+          "Output caps describing the subscribed track's media (optional; "
+          "derived from the catalog when unset)",
           GST_TYPE_CAPS, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_LATENCY,
       g_param_spec_uint ("latency", "Latency",
@@ -559,6 +674,11 @@ gst_moq_src_class_init (GstMoqSrcClass *klass)
       g_param_spec_uint ("draft", "MoQT draft",
           "MoQ Transport draft version to negotiate (16 or 18); "
           "0 offers every draft libmoq supports", 0, 18, DEFAULT_DRAFT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_DISCOVERY_TIMEOUT,
+      g_param_spec_uint ("discovery-timeout", "Discovery timeout",
+          "Fail if the track is not announced within this many ms",
+          0, 600000, DEFAULT_DISCOVERY_TIMEOUT_MS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (element_class, &src_template);
@@ -585,6 +705,7 @@ gst_moq_src_init (GstMoqSrc *self)
   self->track_name = g_strdup (DEFAULT_TRACK_NAME);
   self->latency_ms = DEFAULT_LATENCY_MS;
   self->draft = DEFAULT_DRAFT;
+  self->discovery_timeout_ms = DEFAULT_DISCOVERY_TIMEOUT_MS;
 
   gst_base_src_set_live (GST_BASE_SRC (self), TRUE);
   gst_base_src_set_format (GST_BASE_SRC (self), GST_FORMAT_TIME);
