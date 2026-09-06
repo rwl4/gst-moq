@@ -42,6 +42,7 @@ find_package(libmoq REQUIRED COMPONENTS service)
 add_library(gstmoq MODULE
     src/gstmoqplugin.c
     src/gstmoqsink.c
+    src/gstmoqsinkpad.c
     src/gstmoqsrc.c
     src/gstmoqfmp4.c
     src/gstmoqcodec.c)
@@ -98,4 +99,7 @@ if(BUILD_TESTING)
     target_link_libraries(test_codec_string PRIVATE PkgConfig::GLIB moq::cmaf moq::core)
     target_compile_options(test_codec_string PRIVATE -Wall -Wextra)
     add_test(NAME codec_string COMMAND test_codec_string)
+
+    add_test(NAME smoke
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh ${CMAKE_BINARY_DIR}/plugins)
 endif()
