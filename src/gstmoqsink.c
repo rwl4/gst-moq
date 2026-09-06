@@ -160,8 +160,8 @@ sink_frame_release (void *ctx, const uint8_t *data, size_t len)
   sink_frame_free (ctx);
 }
 
-/* Same for a GBytes payload (CMAF fragments). Used by Task 4's CMAF chain. */
-static void G_GNUC_UNUSED
+/* Same for a GBytes payload (CMAF fragments). */
+static void
 sink_bytes_release (void *ctx, const uint8_t *data, size_t len)
 {
   (void) data;
@@ -525,9 +525,216 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
   return gst_moq_sink_write_object (self, pad, payload, &o, f->map.size);
 }
 
-/* CMAF chain: implemented in Task 4. */
-static GstFlowReturn gst_moq_sink_chain_cmaf (GstMoqSink *self,
-    GstMoqSinkPad *pad, GstBuffer *buffer);
+/* -- CMAF path (request pads) ------------------------------------------- */
+
+/* Register a CMAF track from its init segment (ftyp + moov). */
+static gboolean
+gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
+{
+  gsize init_len;
+  const guint8 *init_data = g_bytes_get_data (init, &init_len);
+
+  moq_cmaf_init_info_init (&pad->init_info);
+  moq_result_t rc = moq_cmaf_parse_init (
+      (moq_bytes_t) { init_data, init_len }, &pad->init_info);
+  if (rc != MOQ_OK) {
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+        ("could not parse CMAF init segment on pad %s (rc=%d)",
+            GST_PAD_NAME (pad), (int) rc), (NULL));
+    return FALSE;
+  }
+  pad->has_init_info = TRUE;
+
+  gchar *codec = gst_moq_codec_string_from_init (&pad->init_info);
+  if (!codec) {
+    GST_ELEMENT_ERROR (self, STREAM, CODEC_NOT_FOUND,
+        ("unsupported codec in CMAF init segment on pad %s (libmoq kind %d); "
+            "this plugin publishes avc1, mp4a and opus", GST_PAD_NAME (pad),
+            (int) pad->init_info.codec_kind), (NULL));
+    return FALSE;
+  }
+  if ((pad->media_type == MOQ_MEDIA_TYPE_AUDIO) !=
+      (pad->init_info.codec_kind == MOQ_CMAF_CODEC_AAC ||
+          pad->init_info.codec_kind == MOQ_CMAF_CODEC_OPUS)) {
+    GST_ELEMENT_ERROR (self, STREAM, WRONG_TYPE,
+        ("pad %s is %s but the init segment carries codec %s",
+            GST_PAD_NAME (pad),
+            pad->media_type == MOQ_MEDIA_TYPE_AUDIO ? "audio" : "video",
+            codec), (NULL));
+    g_free (codec);
+    return FALSE;
+  }
+
+  gchar channels[16] = "2";
+  if (pad->init_info.channel_count > 0)
+    g_snprintf (channels, sizeof channels, "%u", pad->init_info.channel_count);
+
+  moq_media_track_cfg_t tc;
+  moq_media_track_cfg_init (&tc);
+  tc.name.data = (const uint8_t *) pad->track_name;
+  tc.name.len = strlen (pad->track_name);
+  tc.media_type = pad->media_type;
+  tc.packaging = MOQ_MEDIA_PACKAGING_CMAF;
+  tc.codec.data = (const uint8_t *) codec;
+  tc.codec.len = strlen (codec);
+  tc.is_live = TRUE;
+  tc.bitrate = pad->bitrate;
+  tc.timescale = pad->init_info.timescale;
+  tc.init_data.data = init_data;
+  tc.init_data.len = init_len;
+  tc.emit_sap_timeline = self->sap_timeline;
+  if (pad->media_type == MOQ_MEDIA_TYPE_VIDEO) {
+    tc.width = pad->init_info.width;
+    tc.height = pad->init_info.height;
+    if (pad->fps_n > 0 && pad->fps_d > 0)
+      tc.framerate_millis = gst_util_uint64_scale_int (1000, pad->fps_n, pad->fps_d);
+  } else {
+    tc.samplerate = pad->init_info.samplerate;
+    tc.channel_config.data = (const uint8_t *) channels;
+    tc.channel_config.len = strlen (channels);
+  }
+
+  g_mutex_lock (&self->send_lock);
+  if (!self->sender) {
+    g_mutex_unlock (&self->send_lock);
+    g_free (codec);
+    return FALSE;
+  }
+  rc = moq_media_sender_add_track (self->sender, &tc, &pad->track);
+  g_mutex_unlock (&self->send_lock);
+  if (rc != MOQ_OK) {
+    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
+        ("could not add CMAF track \"%s\" codec=%s (rc=%d)",
+            pad->track_name, codec, (int) rc), (NULL));
+  } else {
+    GST_INFO_OBJECT (pad, "added CMAF track %s codec=%s %ux%u sr=%u ch=%s "
+        "timescale=%u init=%" G_GSIZE_FORMAT " B", pad->track_name, codec,
+        pad->init_info.width, pad->init_info.height,
+        pad->init_info.samplerate, channels, pad->init_info.timescale,
+        init_len);
+  }
+  g_free (codec);
+  return rc == MOQ_OK;
+}
+
+/* Send one moof+mdat fragment as a MoQ object. Takes the GBytes reference. */
+static GstFlowReturn
+gst_moq_sink_send_fragment (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *frag)
+{
+  gsize len;
+  const guint8 *data = g_bytes_get_data (frag, &len);
+
+  /* First sample flags decide whether this fragment opens a group. */
+  moq_cmaf_sample_t samples[1];
+  moq_cmaf_fragment_info_t fi;
+  moq_cmaf_fragment_info_init (&fi, samples, 1);
+  moq_result_t rc = moq_cmaf_parse_fragment ((moq_bytes_t) { data, len }, &fi);
+  if (rc != MOQ_OK && rc != MOQ_ERR_BUFFER) {   /* BUFFER = valid, >1 sample */
+    g_bytes_unref (frag);
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+        ("malformed CMAF fragment on pad %s (rc=%d)", GST_PAD_NAME (pad),
+            (int) rc), (NULL));
+    return GST_FLOW_ERROR;
+  }
+  guint32 first_flags = fi.sample_count > 0 ? samples[0].flags : fi.default_sample_flags;
+  gboolean sync = pad->media_type == MOQ_MEDIA_TYPE_AUDIO ||
+      moq_cmaf_sap_from_sample_flags (first_flags) != MOQ_SAP_NONE;
+
+  moq_rcbuf_t *payload = NULL;
+  if (moq_rcbuf_wrap (moq_alloc_default (), data, len, sink_bytes_release,
+          frag, &payload) != MOQ_OK) {
+    g_bytes_unref (frag);
+    GST_ELEMENT_ERROR (self, RESOURCE, WRITE, ("rcbuf wrap failed"), (NULL));
+    return GST_FLOW_ERROR;
+  }
+
+  moq_media_send_object_t o;
+  memset (&o, 0, sizeof o);
+  o.struct_size = sizeof o;
+  o.payload = payload;
+  o.properties = NULL;          /* CMAF timing lives in the fragment */
+  o.is_sync = sync;
+  o.starts_group = sync;
+  if (sync) {
+    o.has_sap_type = TRUE;
+    o.sap_type = MOQ_SAP_TYPE_1;
+  }
+  return gst_moq_sink_write_object (self, pad, payload, &o, len);
+}
+
+static GstFlowReturn
+gst_moq_sink_chain_cmaf (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
+{
+  g_mutex_lock (&self->send_lock);
+  if (!self->sender) {
+    g_mutex_unlock (&self->send_lock);
+    gst_buffer_unref (buffer);
+    return GST_FLOW_FLUSHING;
+  }
+  gboolean fatal = moq_media_sender_is_fatal (self->sender);
+  guint64 fatal_code = fatal ? moq_media_sender_fatal_code (self->sender) : 0;
+  g_mutex_unlock (&self->send_lock);
+  if (fatal) {
+    GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+        ("media sender failed (code=%" G_GUINT64_FORMAT ")", fatal_code),
+        (NULL));
+    gst_buffer_unref (buffer);
+    return GST_FLOW_ERROR;
+  }
+
+  GstFlowReturn ret = gst_moq_sink_sync (self, pad, buffer);
+  if (ret != GST_FLOW_OK) {
+    gst_buffer_unref (buffer);
+    return ret;
+  }
+
+  GstMapInfo map;
+  if (!gst_buffer_map (buffer, &map, GST_MAP_READ)) {
+    gst_buffer_unref (buffer);
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("failed to map buffer"), (NULL));
+    return GST_FLOW_ERROR;
+  }
+  GError *err = NULL;
+  gboolean ok = gst_moq_fmp4_splitter_push (&pad->splitter, map.data, map.size, &err);
+  gst_buffer_unmap (buffer, &map);
+  gst_buffer_unref (buffer);
+  if (!ok) {
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+        ("fragmented MP4 on pad %s: %s", GST_PAD_NAME (pad), err->message), (NULL));
+    g_error_free (err);
+    return GST_FLOW_ERROR;
+  }
+
+  GstMoqFmp4Unit *u;
+  while (ret == GST_FLOW_OK && (u = gst_moq_fmp4_splitter_pull (&pad->splitter))) {
+    if (u->kind == GST_MOQ_FMP4_INIT) {
+      if (pad->track) {
+        /* A new init segment mid-stream is a codec change; not supported. */
+        GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+            ("pad %s received a second init segment; codec changes are not "
+                "supported", GST_PAD_NAME (pad)), (NULL));
+        ret = GST_FLOW_ERROR;
+      } else {
+        g_clear_pointer (&pad->init, g_bytes_unref);
+        pad->init = g_bytes_ref (u->data);
+        if (!gst_moq_sink_add_cmaf_track (self, pad, pad->init))
+          ret = GST_FLOW_ERROR;
+      }
+    } else {
+      if (!pad->track) {
+        GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+            ("fragment before init segment on pad %s", GST_PAD_NAME (pad)), (NULL));
+        ret = GST_FLOW_ERROR;
+      } else {
+        ret = gst_moq_sink_send_fragment (self, pad, g_bytes_ref (u->data));
+      }
+    }
+    gst_moq_fmp4_unit_free (u);
+  }
+  if (gst_moq_fmp4_splitter_skipped (&pad->splitter) && pad->objects_sent == 1)
+    GST_DEBUG_OBJECT (pad, "skipping non-media top-level boxes (styp/sidx/...)");
+  return ret;
+}
 
 /* -- pad functions -------------------------------------------------------- */
 
@@ -1141,15 +1348,4 @@ gst_moq_sink_init (GstMoqSink *self)
   gst_element_add_pad (GST_ELEMENT (self), GST_PAD (self->locpad));
 
   GST_OBJECT_FLAG_SET (self, GST_ELEMENT_FLAG_SINK);
-}
-
-/* Task 4 replaces this stub. */
-static GstFlowReturn
-gst_moq_sink_chain_cmaf (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
-{
-  (void) pad;
-  gst_buffer_unref (buffer);
-  GST_ELEMENT_ERROR (self, STREAM, NOT_IMPLEMENTED,
-      ("CMAF pads are not implemented yet"), (NULL));
-  return GST_FLOW_ERROR;
 }
