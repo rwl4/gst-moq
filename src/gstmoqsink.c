@@ -528,7 +528,7 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
 /* -- CMAF path (request pads) ------------------------------------------- */
 
 /* Register a CMAF track from its init segment (ftyp + moov). */
-static gboolean
+static GstFlowReturn
 gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
 {
   gsize init_len;
@@ -541,7 +541,7 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
     GST_ELEMENT_ERROR (self, STREAM, FORMAT,
         ("could not parse CMAF init segment on pad %s (rc=%d)",
             GST_PAD_NAME (pad), (int) rc), (NULL));
-    return FALSE;
+    return GST_FLOW_ERROR;
   }
   pad->has_init_info = TRUE;
 
@@ -551,7 +551,7 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
         ("unsupported codec in CMAF init segment on pad %s (libmoq kind %d); "
             "this plugin publishes avc1, mp4a and opus", GST_PAD_NAME (pad),
             (int) pad->init_info.codec_kind), (NULL));
-    return FALSE;
+    return GST_FLOW_ERROR;
   }
   if ((pad->media_type == MOQ_MEDIA_TYPE_AUDIO) !=
       (pad->init_info.codec_kind == MOQ_CMAF_CODEC_AAC ||
@@ -562,7 +562,7 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
             pad->media_type == MOQ_MEDIA_TYPE_AUDIO ? "audio" : "video",
             codec), (NULL));
     g_free (codec);
-    return FALSE;
+    return GST_FLOW_ERROR;
   }
 
   gchar channels[16] = "2";
@@ -598,7 +598,7 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
   if (!self->sender) {
     g_mutex_unlock (&self->send_lock);
     g_free (codec);
-    return FALSE;
+    return GST_FLOW_FLUSHING;
   }
   rc = moq_media_sender_add_track (self->sender, &tc, &pad->track);
   g_mutex_unlock (&self->send_lock);
@@ -606,15 +606,19 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not add CMAF track \"%s\" codec=%s (rc=%d)",
             pad->track_name, codec, (int) rc), (NULL));
-  } else {
-    GST_INFO_OBJECT (pad, "added CMAF track %s codec=%s %ux%u sr=%u ch=%s "
-        "timescale=%u init=%" G_GSIZE_FORMAT " B", pad->track_name, codec,
+  } else if (pad->media_type == MOQ_MEDIA_TYPE_VIDEO) {
+    GST_INFO_OBJECT (pad, "added CMAF track %s codec=%s %ux%u timescale=%u "
+        "init=%" G_GSIZE_FORMAT " B", pad->track_name, codec,
         pad->init_info.width, pad->init_info.height,
+        pad->init_info.timescale, init_len);
+  } else {
+    GST_INFO_OBJECT (pad, "added CMAF track %s codec=%s sr=%u ch=%s "
+        "timescale=%u init=%" G_GSIZE_FORMAT " B", pad->track_name, codec,
         pad->init_info.samplerate, channels, pad->init_info.timescale,
         init_len);
   }
   g_free (codec);
-  return rc == MOQ_OK;
+  return rc == MOQ_OK ? GST_FLOW_OK : GST_FLOW_ERROR;
 }
 
 /* Send one moof+mdat fragment as a MoQ object. Takes the GBytes reference. */
@@ -624,21 +628,38 @@ gst_moq_sink_send_fragment (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *frag)
   gsize len;
   const guint8 *data = g_bytes_get_data (frag, &len);
 
-  /* First sample flags decide whether this fragment opens a group. */
-  moq_cmaf_sample_t samples[1];
+  /* First sample flags decide whether this fragment opens a group. Start
+   * with a stack array; if the fragment holds more samples than that,
+   * MOQ_ERR_BUFFER reports the required count (trusted, fragment-bounded)
+   * without filling any sample, so grow and reparse once. Only MOQ_OK means
+   * the sample table (and samples[0].flags) is actually populated. */
+  moq_cmaf_sample_t stack_samples[64];
+  moq_cmaf_sample_t *heap_samples = NULL;
   moq_cmaf_fragment_info_t fi;
-  moq_cmaf_fragment_info_init (&fi, samples, 1);
+  moq_cmaf_fragment_info_init (&fi, stack_samples, G_N_ELEMENTS (stack_samples));
   moq_result_t rc = moq_cmaf_parse_fragment ((moq_bytes_t) { data, len }, &fi);
-  if (rc != MOQ_OK && rc != MOQ_ERR_BUFFER) {   /* BUFFER = valid, >1 sample */
+  if (rc == MOQ_ERR_BUFFER) {
+    heap_samples = g_new (moq_cmaf_sample_t, fi.sample_count);
+    moq_cmaf_fragment_info_init (&fi, heap_samples, fi.sample_count);
+    rc = moq_cmaf_parse_fragment ((moq_bytes_t) { data, len }, &fi);
+  }
+  if (rc != MOQ_OK) {
+    g_clear_pointer (&heap_samples, g_free);
     g_bytes_unref (frag);
     GST_ELEMENT_ERROR (self, STREAM, FORMAT,
         ("malformed CMAF fragment on pad %s (rc=%d)", GST_PAD_NAME (pad),
             (int) rc), (NULL));
     return GST_FLOW_ERROR;
   }
-  guint32 first_flags = fi.sample_count > 0 ? samples[0].flags : fi.default_sample_flags;
+  /* sample_is_non_sync_sample (bit 0x00010000): clear means this sample IS
+   * a sync sample. Audio fragments are always treated as sync points. Do
+   * not use moq_cmaf_sap_from_sample_flags() here: it also reports UNKNOWN
+   * (possible open-GOP SAP-3) for a non-sync-but-independent sample, which
+   * is not what "opens a group" means for mp4mux's trun first_sample_flags. */
+  guint32 first_flags = fi.sample_count > 0 ? fi.samples[0].flags : fi.default_sample_flags;
   gboolean sync = pad->media_type == MOQ_MEDIA_TYPE_AUDIO ||
-      moq_cmaf_sap_from_sample_flags (first_flags) != MOQ_SAP_NONE;
+      !(first_flags & 0x00010000);
+  g_clear_pointer (&heap_samples, g_free);
 
   moq_rcbuf_t *payload = NULL;
   if (moq_rcbuf_wrap (moq_alloc_default (), data, len, sink_bytes_release,
@@ -717,8 +738,7 @@ gst_moq_sink_chain_cmaf (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer
       } else {
         g_clear_pointer (&pad->init, g_bytes_unref);
         pad->init = g_bytes_ref (u->data);
-        if (!gst_moq_sink_add_cmaf_track (self, pad, pad->init))
-          ret = GST_FLOW_ERROR;
+        ret = gst_moq_sink_add_cmaf_track (self, pad, pad->init);
       }
     } else {
       if (!pad->track) {
@@ -731,8 +751,10 @@ gst_moq_sink_chain_cmaf (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer
     }
     gst_moq_fmp4_unit_free (u);
   }
-  if (gst_moq_fmp4_splitter_skipped (&pad->splitter) && pad->objects_sent == 1)
+  if (!pad->skip_logged && gst_moq_fmp4_splitter_skipped (&pad->splitter)) {
     GST_DEBUG_OBJECT (pad, "skipping non-media top-level boxes (styp/sidx/...)");
+    pad->skip_logged = TRUE;
+  }
   return ret;
 }
 
@@ -804,10 +826,14 @@ gst_moq_sink_drain (GstMoqSink *self)
     moq_endpoint_drain (self->ep, EOS_DRAIN_TIMEOUT_US);
 }
 
-/* TRUE (once) when every pad (always + requested) has seen EOS and no other
- * thread has already claimed the EOS post. The all-eos check, the
- * eos_posted check, and claiming it happen under one OBJECT_LOCK so two
- * pads reaching EOS at the same time cannot both drain and post. */
+/* TRUE (once) when every LINKED pad (always + requested) has seen EOS and
+ * no other thread has already claimed the EOS post. An unlinked pad (e.g.
+ * the always "sink" pad in a CMAF-only pipeline that only uses video_%u/
+ * audio_%u) never gets an event pushed into it, so it is excluded from the
+ * count entirely; if no pad is linked at all, EOS is never claimed. The
+ * all-eos check, the eos_posted check, and claiming it happen under one
+ * OBJECT_LOCK so two pads reaching EOS at the same time cannot both drain
+ * and post. */
 static gboolean
 gst_moq_sink_claim_eos (GstMoqSink *self)
 {
@@ -815,10 +841,16 @@ gst_moq_sink_claim_eos (GstMoqSink *self)
   GST_OBJECT_LOCK (self);
   if (!self->eos_posted) {
     gboolean all = TRUE;
-    for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
-      if (!GST_MOQ_SINK_PAD (l->data)->eos)
+    gboolean any_linked = FALSE;
+    for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next) {
+      GstMoqSinkPad *p = GST_MOQ_SINK_PAD (l->data);
+      if (!gst_pad_is_linked (GST_PAD (p)))
+        continue;
+      any_linked = TRUE;
+      if (!p->eos)
         all = FALSE;
-    if (all) {
+    }
+    if (all && any_linked) {
       self->eos_posted = TRUE;
       claim = TRUE;
     }

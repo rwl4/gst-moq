@@ -42,6 +42,7 @@ struct _GstMoqSinkPad
   GBytes              *init;         /* ftyp + moov as sent to the catalog */
   moq_cmaf_init_info_t init_info;    /* borrows from `init` */
   gboolean             has_init_info;
+  gboolean             skip_logged;  /* one-shot "skipping non-media boxes" log */
 };
 
 GstMoqSinkPad *gst_moq_sink_pad_new (GstPadTemplate *templ, const gchar *name,

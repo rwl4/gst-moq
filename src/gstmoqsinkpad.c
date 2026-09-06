@@ -95,6 +95,7 @@ gst_moq_sink_pad_reset (GstMoqSinkPad *pad)
   gst_moq_fmp4_splitter_init (&pad->splitter, max_box);
   g_clear_pointer (&pad->init, g_bytes_unref);
   pad->has_init_info = FALSE;
+  pad->skip_logged = FALSE;
   gst_segment_init (&pad->segment, GST_FORMAT_UNDEFINED);
 }
 
