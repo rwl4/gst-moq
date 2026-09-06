@@ -18,8 +18,22 @@
  * drops our GstBuffer/GBytes reference.
  *
  * Sync: with sync=true (default) each chain waits on the pipeline clock for
- * the buffer's running time, so non-live sources are paced like a normal
- * sink. Live sources already arrive at rate.
+ * the buffer's running time plus the configured latency, so non-live
+ * sources are paced like a normal sink. Live sources already arrive at
+ * rate. GST_EVENT_LATENCY is flagged GST_EVENT_TYPE_UPSTREAM (see
+ * gstevent.h), so gst_pad_send_event() on one of our (sink-direction) pads
+ * refuses it outright ("sending latency event in wrong direction") without
+ * ever calling the pad's event function — the same reason GstBaseSink
+ * intercepts GST_EVENT_LATENCY in its own send_event override instead of
+ * routing it through a pad. element_class->send_event does the same here:
+ * it stores the latency directly, and only forwards other (non-latency)
+ * events onto the sink pads via gst_pad_send_event.
+ *
+ * Thread safety: libmoq's media sender expects every call
+ * (add_track/write/end_track/get_stats/is_fatal/fatal_code) to come from a
+ * single application thread. With request pads several GStreamer streaming
+ * threads share one sender, so all sender calls are serialized by
+ * self->send_lock; it is never held while waiting on the pipeline clock.
  */
 #include "gstmoqsink.h"
 #include "gstmoqsinkpad.h"
@@ -84,8 +98,10 @@ struct _GstMoqSink
   /* runtime */
   moq_endpoint_t     *ep;
   moq_media_sender_t *sender;
+  GMutex              send_lock;  /* serializes every moq_media_sender_* call */
   gboolean            started;
   gboolean            eos_posted;
+  GstClockTime        latency;    /* from the last GST_EVENT_LATENCY, under OBJECT_LOCK */
 
   gchar      **ns_tokens;
   moq_bytes_t *ns_bytes;
@@ -259,7 +275,9 @@ static GstFlowReturn
 gst_moq_sink_write_object (GstMoqSink *self, GstMoqSinkPad *pad,
     moq_rcbuf_t *payload, moq_media_send_object_t *o, gsize len)
 {
+  g_mutex_lock (&self->send_lock);
   moq_result_t rc = moq_media_sender_write (self->sender, pad->track, o);
+  g_mutex_unlock (&self->send_lock);
   switch (rc) {
     case MOQ_OK:
       pad->objects_sent++;
@@ -325,7 +343,8 @@ gst_moq_sink_sync (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buf)
     gst_object_unref (clock);
     return GST_FLOW_FLUSHING;
   }
-  pad->clock_id = gst_clock_new_single_shot_id (clock, base + rt);
+  GstClockTime latency = self->latency;
+  pad->clock_id = gst_clock_new_single_shot_id (clock, base + rt + latency);
   GST_OBJECT_UNLOCK (self);
 
   GstClockReturn cr = gst_clock_id_wait (pad->clock_id, NULL);
@@ -393,7 +412,9 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
   if (pad->fps_n > 0 && pad->fps_d > 0)
     tc.framerate_millis = gst_util_uint64_scale_int (1000, pad->fps_n, pad->fps_d);
 
+  g_mutex_lock (&self->send_lock);
   moq_result_t rc = moq_media_sender_add_track (self->sender, &tc, &pad->track);
+  g_mutex_unlock (&self->send_lock);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not add track \"%s\" (rc=%d)", pad->track_name, (int) rc),
@@ -411,10 +432,14 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
 static GstFlowReturn
 gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
 {
-  if (moq_media_sender_is_fatal (self->sender)) {
+  g_mutex_lock (&self->send_lock);
+  gboolean fatal = moq_media_sender_is_fatal (self->sender);
+  guint64 fatal_code = fatal ? moq_media_sender_fatal_code (self->sender) : 0;
+  g_mutex_unlock (&self->send_lock);
+  if (fatal) {
     GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
-        ("media sender failed (code=%" G_GUINT64_FORMAT ")",
-            (guint64) moq_media_sender_fatal_code (self->sender)), (NULL));
+        ("media sender failed (code=%" G_GUINT64_FORMAT ")", fatal_code),
+        (NULL));
     gst_buffer_unref (buffer);
     return GST_FLOW_ERROR;
   }
@@ -505,7 +530,9 @@ gst_moq_sink_end_track (GstMoqSink *self, GstMoqSinkPad *pad)
 {
   if (!self->sender || !pad->track)
     return;
+  g_mutex_lock (&self->send_lock);
   moq_result_t rc = moq_media_sender_end_track (self->sender, pad->track);
+  g_mutex_unlock (&self->send_lock);
   if (rc != MOQ_OK && rc != MOQ_ERR_WRONG_STATE)
     GST_WARNING_OBJECT (pad, "end_track failed (rc=%d)", (int) rc);
 }
@@ -518,13 +545,19 @@ gst_moq_sink_drain (GstMoqSink *self)
   gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
   for (;;) {
     moq_media_sender_stats_t st;
-    if (moq_media_sender_get_stats (self->sender, &st, sizeof st) != MOQ_OK)
+    g_mutex_lock (&self->send_lock);
+    moq_result_t rc = moq_media_sender_get_stats (self->sender, &st, sizeof st);
+    g_mutex_unlock (&self->send_lock);
+    if (rc != MOQ_OK)
       break;
     if (st.objects_queued == 0) {
       GST_INFO_OBJECT (self, "send queue drained on EOS");
       break;
     }
-    if (moq_media_sender_is_fatal (self->sender))
+    g_mutex_lock (&self->send_lock);
+    gboolean fatal = moq_media_sender_is_fatal (self->sender);
+    g_mutex_unlock (&self->send_lock);
+    if (fatal)
       break;
     if (g_get_monotonic_time () >= deadline) {
       GST_WARNING_OBJECT (self, "EOS drain timed out, %" G_GUINT64_FORMAT
@@ -537,17 +570,27 @@ gst_moq_sink_drain (GstMoqSink *self)
     moq_endpoint_drain (self->ep, EOS_DRAIN_TIMEOUT_US);
 }
 
-/* TRUE when every pad (always + requested) has seen EOS. */
+/* TRUE (once) when every pad (always + requested) has seen EOS and no other
+ * thread has already claimed the EOS post. The all-eos check, the
+ * eos_posted check, and claiming it happen under one OBJECT_LOCK so two
+ * pads reaching EOS at the same time cannot both drain and post. */
 static gboolean
-gst_moq_sink_all_eos (GstMoqSink *self)
+gst_moq_sink_claim_eos (GstMoqSink *self)
 {
-  gboolean all = TRUE;
+  gboolean claim = FALSE;
   GST_OBJECT_LOCK (self);
-  for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
-    if (!GST_MOQ_SINK_PAD (l->data)->eos)
-      all = FALSE;
+  if (!self->eos_posted) {
+    gboolean all = TRUE;
+    for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
+      if (!GST_MOQ_SINK_PAD (l->data)->eos)
+        all = FALSE;
+    if (all) {
+      self->eos_posted = TRUE;
+      claim = TRUE;
+    }
+  }
   GST_OBJECT_UNLOCK (self);
-  return all;
+  return claim;
 }
 
 static gboolean
@@ -583,13 +626,18 @@ gst_moq_sink_event (GstPad *gpad, GstObject *parent, GstEvent *event)
         moq_endpoint_set_interrupted (self->ep, FALSE);
       pad->eos = FALSE;
       gst_segment_init (&pad->segment, GST_FORMAT_UNDEFINED);
+      GST_OBJECT_LOCK (self);
+      self->eos_posted = FALSE;
+      GST_OBJECT_UNLOCK (self);
       break;
+    /* GST_EVENT_LATENCY never reaches here: it is flagged UPSTREAM, so
+     * gst_pad_send_event() on a sink pad refuses it before invoking this
+     * function. It is intercepted in gst_moq_sink_send_event() instead. */
     case GST_EVENT_EOS:
       pad->eos = TRUE;
       gst_moq_sink_end_track (self, pad);
-      if (gst_moq_sink_all_eos (self) && !self->eos_posted) {
+      if (gst_moq_sink_claim_eos (self)) {
         gst_moq_sink_drain (self);
-        self->eos_posted = TRUE;
         gst_element_post_message (GST_ELEMENT (self),
             gst_message_new_eos (GST_OBJECT (self)));
       }
@@ -625,6 +673,50 @@ gst_moq_sink_request_new_pad (GstElement *element, GstPadTemplate *templ,
   gst_element_add_pad (element, GST_PAD (pad));
   GST_INFO_OBJECT (pad, "requested CMAF %s pad", is_audio ? "audio" : "video");
   return GST_PAD (pad);
+}
+
+/* A plain GstElement has no source pads, so the base gst_element_send_event()
+ * has nothing to route events sent to a sink element to. GST_EVENT_LATENCY
+ * is the one that matters here: it is flagged GST_EVENT_TYPE_UPSTREAM, so
+ * gst_pad_send_event() on any of our (sink-direction) pads would refuse it
+ * ("wrong direction") without ever calling the pad's event function -- it
+ * must be handled directly, exactly like GstBaseSink does internally.
+ * Anything else is pushed onto every sink pad via gst_pad_send_event(),
+ * which invokes that pad's event function synchronously (e.g. a flushing
+ * seek or a forced EOS sent straight to the element rather than flowing
+ * through the pipeline). */
+static gboolean
+gst_moq_sink_send_event (GstElement *element, GstEvent *event)
+{
+  GstMoqSink *self = GST_MOQ_SINK (element);
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_LATENCY) {
+    GstClockTime latency;
+    gst_event_parse_latency (event, &latency);
+    GST_OBJECT_LOCK (self);
+    self->latency = latency;
+    GST_OBJECT_UNLOCK (self);
+    GST_DEBUG_OBJECT (self, "latency configured: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (latency));
+    gst_event_unref (event);
+    return TRUE;
+  }
+
+  GList *pads = NULL, *l;
+  gboolean ret = FALSE;
+
+  GST_OBJECT_LOCK (self);
+  for (l = element->sinkpads; l; l = l->next)
+    pads = g_list_prepend (pads, gst_object_ref (GST_PAD (l->data)));
+  GST_OBJECT_UNLOCK (self);
+
+  for (l = pads; l; l = l->next) {
+    if (gst_pad_send_event (GST_PAD (l->data), gst_event_ref (event)))
+      ret = TRUE;
+  }
+  g_list_free_full (pads, gst_object_unref);
+  gst_event_unref (event);
+  return ret;
 }
 
 static void
@@ -720,7 +812,10 @@ gst_moq_sink_stop (GstMoqSink *self)
 
   if (self->sender) {
     moq_media_sender_stats_t st;
-    if (moq_media_sender_get_stats (self->sender, &st, sizeof st) == MOQ_OK)
+    g_mutex_lock (&self->send_lock);
+    moq_result_t stats_rc = moq_media_sender_get_stats (self->sender, &st, sizeof st);
+    g_mutex_unlock (&self->send_lock);
+    if (stats_rc == MOQ_OK)
       GST_INFO_OBJECT (self, "sender stats: written=%" G_GUINT64_FORMAT
           " sent=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT
           " dropped=%" G_GUINT64_FORMAT, st.objects_written, st.objects_sent,
@@ -781,6 +876,7 @@ gst_moq_sink_change_state (GstElement *element, GstStateChange transition)
       GST_OBJECT_LOCK (self);
       for (GList *l = element->sinkpads; l; l = l->next)
         GST_MOQ_SINK_PAD (l->data)->flushing = FALSE;
+      self->eos_posted = FALSE;
       GST_OBJECT_UNLOCK (self);
       if (self->ep)
         moq_endpoint_set_interrupted (self->ep, FALSE);
@@ -902,6 +998,7 @@ gst_moq_sink_finalize (GObject *object)
   g_free (self->relay_path);
   g_free (self->namespace_str);
   g_free (self->codec);
+  g_mutex_clear (&self->send_lock);
   G_OBJECT_CLASS (gst_moq_sink_parent_class)->finalize (object);
 }
 
@@ -980,6 +1077,7 @@ gst_moq_sink_class_init (GstMoqSinkClass *klass)
       "Ray L <ray@raylucke.com>");
 
   element_class->change_state = GST_DEBUG_FUNCPTR (gst_moq_sink_change_state);
+  element_class->send_event = GST_DEBUG_FUNCPTR (gst_moq_sink_send_event);
   element_class->request_new_pad = GST_DEBUG_FUNCPTR (gst_moq_sink_request_new_pad);
   element_class->release_pad = GST_DEBUG_FUNCPTR (gst_moq_sink_release_pad);
 }
@@ -995,6 +1093,8 @@ gst_moq_sink_init (GstMoqSink *self)
   self->draft = DEFAULT_DRAFT;
   self->sync = TRUE;
   self->max_fragment_size = DEFAULT_MAX_FRAGMENT;
+  self->latency = 0;
+  g_mutex_init (&self->send_lock);
 
   GstPadTemplate *templ = gst_static_pad_template_get (&sink_template);
   self->locpad = gst_moq_sink_pad_new (templ, "sink", MOQ_MEDIA_TYPE_VIDEO,
