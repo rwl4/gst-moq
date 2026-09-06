@@ -42,7 +42,8 @@ find_package(libmoq REQUIRED COMPONENTS service)
 add_library(gstmoq MODULE
     src/gstmoqplugin.c
     src/gstmoqsink.c
-    src/gstmoqsrc.c)
+    src/gstmoqsrc.c
+    src/gstmoqfmp4.c)
 
 target_link_libraries(gstmoq PRIVATE
     PkgConfig::GST
@@ -75,3 +76,16 @@ set_target_properties(gstmoq PROPERTIES
     PREFIX "lib"
     OUTPUT_NAME "gstmoq"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins")
+
+# Unit tests: plain GLib executables, no GStreamer pipeline, no network.
+include(CTest)
+if(BUILD_TESTING)
+    pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
+
+    add_executable(test_fmp4_splitter
+        tests/test_fmp4_splitter.c
+        src/gstmoqfmp4.c)
+    target_include_directories(test_fmp4_splitter PRIVATE src)
+    target_link_libraries(test_fmp4_splitter PRIVATE PkgConfig::GLIB)
+    add_test(NAME fmp4_splitter COMMAND test_fmp4_splitter)
+endif()
