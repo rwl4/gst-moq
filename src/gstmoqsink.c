@@ -29,6 +29,13 @@
  * it stores the latency directly, and only forwards other (non-latency)
  * events onto the sink pads via gst_pad_send_event.
  *
+ * GstElement, not GstBaseSink: this is a plain GstElement, so it never
+ * preroll waits on the first buffer -- GST_STATE_CHANGE_READY_TO_PAUSED
+ * returns immediately -- and reaching PAUSED does not pause publishing;
+ * only GstBaseSink's "sync" property has an equivalent here ("async",
+ * "qos", "max-lateness", "ts-offset", "blocksize", "enable-last-sample"
+ * and "render-delay" do not apply).
+ *
  * Thread safety: libmoq's media sender expects every call
  * (add_track/write/end_track/get_stats/is_fatal/fatal_code) to come from a
  * single application thread. With request pads several GStreamer streaming
@@ -107,6 +114,7 @@ struct _GstMoqSink
   gboolean            started;
   gboolean            eos_posted;
   GstClockTime        latency;    /* from the last GST_EVENT_LATENCY, under OBJECT_LOCK */
+  gint                flush_count; /* concurrent FLUSH_START/STOP pads, under OBJECT_LOCK */
 
   gchar      **ns_tokens;
   moq_bytes_t *ns_bytes;
@@ -881,21 +889,45 @@ gst_moq_sink_event (GstPad *gpad, GstObject *parent, GstEvent *event)
     case GST_EVENT_SEGMENT:
       gst_event_copy_segment (event, &pad->segment);
       break;
-    case GST_EVENT_FLUSH_START:
+    case GST_EVENT_FLUSH_START: {
       gst_moq_sink_unschedule (self, pad, TRUE);
-      if (self->ep)
-        moq_endpoint_set_interrupted (self->ep, TRUE);
+      GST_OBJECT_LOCK (self);
+      gboolean was_zero = (self->flush_count == 0);
+      self->flush_count++;
+      GST_OBJECT_UNLOCK (self);
+      /* Only the 0 -> 1 transition sets the endpoint interrupt: with
+       * several pads on one sender, a second concurrent flush must not
+       * clear it while the first is still in progress. self->ep is read
+       * under send_lock, the same lock guarding every other access to it
+       * from the streaming threads (see the file header). */
+      if (was_zero) {
+        g_mutex_lock (&self->send_lock);
+        if (self->ep)
+          moq_endpoint_set_interrupted (self->ep, TRUE);
+        g_mutex_unlock (&self->send_lock);
+      }
       break;
-    case GST_EVENT_FLUSH_STOP:
+    }
+    case GST_EVENT_FLUSH_STOP: {
       gst_moq_sink_unschedule (self, pad, FALSE);
-      if (self->ep)
-        moq_endpoint_set_interrupted (self->ep, FALSE);
+      GST_OBJECT_LOCK (self);
+      if (self->flush_count > 0)
+        self->flush_count--;
+      gboolean now_zero = (self->flush_count == 0);
+      GST_OBJECT_UNLOCK (self);
+      if (now_zero) {
+        g_mutex_lock (&self->send_lock);
+        if (self->ep)
+          moq_endpoint_set_interrupted (self->ep, FALSE);
+        g_mutex_unlock (&self->send_lock);
+      }
       pad->eos = FALSE;
       gst_segment_init (&pad->segment, GST_FORMAT_UNDEFINED);
       GST_OBJECT_LOCK (self);
       self->eos_posted = FALSE;
       GST_OBJECT_UNLOCK (self);
       break;
+    }
     /* GST_EVENT_LATENCY never reaches here: it is flagged UPSTREAM, so
      * gst_pad_send_event() on a sink pad refuses it before invoking this
      * function. It is intercepted in gst_moq_sink_send_event() instead. */
@@ -1008,6 +1040,7 @@ gst_moq_sink_start (GstMoqSink *self)
   self->sender = NULL;
   self->eos_posted = FALSE;
   GST_OBJECT_LOCK (self);
+  self->flush_count = 0;
   for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
     gst_moq_sink_pad_reset (GST_MOQ_SINK_PAD (l->data));
   GST_OBJECT_UNLOCK (self);

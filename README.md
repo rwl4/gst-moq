@@ -67,8 +67,18 @@ Common properties: `host`, `port`, `relay-path`, `namespace`, `track-name`,
 `insecure` (skip TLS verification — test only), `draft` (MoQ Transport draft to
 negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
 `codec` (override the derived catalog codec string), `bitrate`, `sync`,
-`sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout` and
-`caps`, which is now optional — it is derived from the catalog when omitted.
+`sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout`,
+`latency` (ms reported through the LATENCY query so synced sinks absorb
+network jitter instead of dropping late frames; default 200) and `caps`,
+which is now optional — it is derived from the catalog when omitted.
+
+`moqsink` is a plain `GstElement`, not a `GstBaseSink`: it does not preroll,
+so `READY` to `PAUSED` returns immediately instead of waiting for the first
+buffer, and `PAUSED` does not pause publishing — buffers already queued keep
+going out to the relay until the pipeline reaches `NULL` or the source stops
+delivering them. Only `sync` is exposed; the other `GstBaseSink` properties
+(`async`, `qos`, `max-lateness`, `ts-offset`, `blocksize`,
+`enable-last-sample`, `render-delay`) do not exist on this element.
 
 `moqsrc` maps LOC presentation times onto the pipeline clock: the first object
 is anchored at the running time of its arrival and later objects keep their

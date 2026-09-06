@@ -290,7 +290,8 @@ topology mismatch; not pursued further here per the task's two-attempt limit.
 | moqsrc, track-name=audio (Opus run) | qtdemux/opusdec | caps negotiated, 48kHz stereo | 0 | n/a |
 | Node-publisher/node-relay interop | — | not reached | `UniPairTopology: no inbound control stream` | — |
 
-Screenshots: `/tmp/claude-chrome-screenshots-XsMJ01/screenshot-1788719467969-2.jpg`
-(AAC run, video visibly playing) and
-`/tmp/claude-chrome-screenshots-XsMJ01/screenshot-1788719546888-3.jpg` (Opus
-run, stats overlay).
+Screenshots (not included in this doc): the AAC run showed the Playa player's
+`<video>` element visibly playing the 640x360 ball test pattern with the
+timeoverlay clock advancing; the Opus run showed the same playback with the
+"stats for nerds" overlay open, reporting the resolution/fps and zero decode
+errors listed in the table above.

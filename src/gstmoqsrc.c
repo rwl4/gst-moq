@@ -310,6 +310,10 @@ gst_moq_src_unlock_stop (GstBaseSrc *bsrc)
   GstMoqSrc *self = GST_MOQ_SRC (bsrc);
   if (self->ep)
     moq_endpoint_set_interrupted (self->ep, FALSE);
+  /* A fragment queued behind an init segment before the flush is now
+   * stale (its track/init state may no longer match); drop it instead of
+   * pushing it out after the flush completes. */
+  g_clear_pointer (&self->pending, gst_buffer_unref);
   return TRUE;
 }
 
@@ -367,15 +371,16 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
         const moq_media_track_desc_t *d = ev.desc;
         GST_INFO_OBJECT (self, "TRACK_ADDED name=%.*s codec=%.*s packaging=%s",
             d ? (int) d->name.len : 0,
-            d ? (const char *) d->name.data : "",
+            d && d->name.data ? (const char *) d->name.data : "",
             d ? (int) d->codec.len : 0,
-            d ? (const char *) d->codec.data : "",
+            d && d->codec.data ? (const char *) d->codec.data : "",
             d && d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF ? "cmaf" : "loc");
         if (d && self->seen_tracks && !self->want_track) {
           if (self->seen_tracks->len)
             g_string_append (self->seen_tracks, ", ");
-          g_string_append_len (self->seen_tracks, (const gchar *) d->name.data,
-              d->name.len);
+          g_string_append_len (self->seen_tracks,
+              d->name.data ? (const gchar *) d->name.data : "",
+              d->name.data ? d->name.len : 0);
         }
         if (d && d->name.len == strlen (self->track_name) &&
             memcmp (d->name.data, self->track_name, d->name.len) == 0) {
@@ -398,7 +403,8 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
               GST_ELEMENT_ERROR (self, CORE, NEGOTIATION,
                   ("track \"%s\" is a LOC track with codec %.*s; set the "
                       "\"caps\" property for it", self->track_name,
-                      (int) d->codec.len, (const char *) d->codec.data),
+                      d->codec.data ? (int) d->codec.len : 0,
+                      d->codec.data ? (const char *) d->codec.data : ""),
                   (NULL));
               self->negotiation_failed = TRUE;
             }
