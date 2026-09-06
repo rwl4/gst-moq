@@ -34,6 +34,11 @@
  * single application thread. With request pads several GStreamer streaming
  * threads share one sender, so all sender calls are serialized by
  * self->send_lock; it is never held while waiting on the pipeline clock.
+ * gst_moq_sink_stop() destroys the sender and clears self->sender to NULL
+ * inside that same lock (one critical section together with the final
+ * get_stats), and every streaming-thread caller re-checks self->sender
+ * under the lock before touching it, so a late call can never dereference a
+ * freed sender.
  */
 #include "gstmoqsink.h"
 #include "gstmoqsinkpad.h"
@@ -276,6 +281,11 @@ gst_moq_sink_write_object (GstMoqSink *self, GstMoqSinkPad *pad,
     moq_rcbuf_t *payload, moq_media_send_object_t *o, gsize len)
 {
   g_mutex_lock (&self->send_lock);
+  if (!self->sender) {
+    g_mutex_unlock (&self->send_lock);
+    moq_rcbuf_decref (payload);
+    return GST_FLOW_FLUSHING;
+  }
   moq_result_t rc = moq_media_sender_write (self->sender, pad->track, o);
   g_mutex_unlock (&self->send_lock);
   switch (rc) {
@@ -413,6 +423,12 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
     tc.framerate_millis = gst_util_uint64_scale_int (1000, pad->fps_n, pad->fps_d);
 
   g_mutex_lock (&self->send_lock);
+  if (!self->sender) {
+    g_mutex_unlock (&self->send_lock);
+    g_free (codec);
+    g_clear_pointer (&avcc, g_bytes_unref);
+    return FALSE;
+  }
   moq_result_t rc = moq_media_sender_add_track (self->sender, &tc, &pad->track);
   g_mutex_unlock (&self->send_lock);
   if (rc != MOQ_OK) {
@@ -433,6 +449,11 @@ static GstFlowReturn
 gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
 {
   g_mutex_lock (&self->send_lock);
+  if (!self->sender) {
+    g_mutex_unlock (&self->send_lock);
+    gst_buffer_unref (buffer);
+    return GST_FLOW_FLUSHING;
+  }
   gboolean fatal = moq_media_sender_is_fatal (self->sender);
   guint64 fatal_code = fatal ? moq_media_sender_fatal_code (self->sender) : 0;
   g_mutex_unlock (&self->send_lock);
@@ -528,9 +549,13 @@ gst_moq_sink_chain (GstPad *gpad, GstObject *parent, GstBuffer *buffer)
 static void
 gst_moq_sink_end_track (GstMoqSink *self, GstMoqSinkPad *pad)
 {
-  if (!self->sender || !pad->track)
+  if (!pad->track)
     return;
   g_mutex_lock (&self->send_lock);
+  if (!self->sender) {
+    g_mutex_unlock (&self->send_lock);
+    return;
+  }
   moq_result_t rc = moq_media_sender_end_track (self->sender, pad->track);
   g_mutex_unlock (&self->send_lock);
   if (rc != MOQ_OK && rc != MOQ_ERR_WRONG_STATE)
@@ -546,7 +571,9 @@ gst_moq_sink_drain (GstMoqSink *self)
   for (;;) {
     moq_media_sender_stats_t st;
     g_mutex_lock (&self->send_lock);
-    moq_result_t rc = moq_media_sender_get_stats (self->sender, &st, sizeof st);
+    moq_result_t rc = self->sender
+        ? moq_media_sender_get_stats (self->sender, &st, sizeof st)
+        : MOQ_ERR_CLOSED;
     g_mutex_unlock (&self->send_lock);
     if (rc != MOQ_OK)
       break;
@@ -555,7 +582,7 @@ gst_moq_sink_drain (GstMoqSink *self)
       break;
     }
     g_mutex_lock (&self->send_lock);
-    gboolean fatal = moq_media_sender_is_fatal (self->sender);
+    gboolean fatal = self->sender ? moq_media_sender_is_fatal (self->sender) : TRUE;
     g_mutex_unlock (&self->send_lock);
     if (fatal)
       break;
@@ -778,12 +805,16 @@ gst_moq_sink_start (GstMoqSink *self)
   sc.namespace_.parts = self->ns_bytes;
   sc.namespace_.count = self->ns_count;
 
-  rc = moq_media_sender_attach (self->ep, &sc, &self->sender);
+  moq_media_sender_t *sender = NULL;
+  rc = moq_media_sender_attach (self->ep, &sc, &sender);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not attach media sender (rc=%d)", (int) rc), (NULL));
     goto fail_ep;
   }
+  g_mutex_lock (&self->send_lock);
+  self->sender = sender;
+  g_mutex_unlock (&self->send_lock);
 
   self->started = TRUE;
   GST_INFO_OBJECT (self, "started: publishing ns=%s via relay %s:%u%s",
@@ -812,16 +843,20 @@ gst_moq_sink_stop (GstMoqSink *self)
 
   if (self->sender) {
     moq_media_sender_stats_t st;
+    /* get_stats, destroy and clearing self->sender all happen under one
+     * critical section so a concurrent streaming-thread call (which only
+     * ever checks self->sender under this same lock) can never observe a
+     * freed sender. */
     g_mutex_lock (&self->send_lock);
     moq_result_t stats_rc = moq_media_sender_get_stats (self->sender, &st, sizeof st);
+    moq_media_sender_destroy (self->sender);
+    self->sender = NULL;
     g_mutex_unlock (&self->send_lock);
     if (stats_rc == MOQ_OK)
       GST_INFO_OBJECT (self, "sender stats: written=%" G_GUINT64_FORMAT
           " sent=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT
           " dropped=%" G_GUINT64_FORMAT, st.objects_written, st.objects_sent,
           st.objects_queued, st.objects_dropped);
-    moq_media_sender_destroy (self->sender);
-    self->sender = NULL;
   }
   if (self->ep) {
     moq_endpoint_stop (self->ep);
