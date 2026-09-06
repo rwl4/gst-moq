@@ -43,7 +43,8 @@ add_library(gstmoq MODULE
     src/gstmoqplugin.c
     src/gstmoqsink.c
     src/gstmoqsrc.c
-    src/gstmoqfmp4.c)
+    src/gstmoqfmp4.c
+    src/gstmoqcodec.c)
 
 target_link_libraries(gstmoq PRIVATE
     PkgConfig::GST
@@ -89,4 +90,12 @@ if(BUILD_TESTING)
     target_link_libraries(test_fmp4_splitter PRIVATE PkgConfig::GLIB)
     target_compile_options(test_fmp4_splitter PRIVATE -Wall -Wextra)
     add_test(NAME fmp4_splitter COMMAND test_fmp4_splitter)
+
+    add_executable(test_codec_string
+        tests/test_codec_string.c
+        src/gstmoqcodec.c)
+    target_include_directories(test_codec_string PRIVATE src)
+    target_link_libraries(test_codec_string PRIVATE PkgConfig::GLIB moq::cmaf moq::core)
+    target_compile_options(test_codec_string PRIVATE -Wall -Wextra)
+    add_test(NAME codec_string COMMAND test_codec_string)
 endif()
