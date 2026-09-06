@@ -224,60 +224,58 @@ and are not yet updated for the CMAF/MSE path; frame counts are only
 observable through the `<video>` element itself in this mode. Not a gst-moq
 issue — recorded as an observation, same as the "Gaps" counter in section 5.
 
-### 6.3 Node-relay interop: libmoq WebTransport handshake rejected
+### 6.3 Interop with a foreign CMSF-01 publisher (moqxr)
 
-Interop target: Playa's `node-publisher` example, publishing a CMSF-01
-catalog through Playa's local `node-relay` (draft-18 only; the public
-moq-relay.red5.net cannot be used here because the node-publisher pins the
-relay's certificate hash and only the local relay's cert is available).
+Interop target: `moqxr` (`openmoq-publisher`, the C++ OpenMOQ publisher one
+directory up), which packages a progressive MP4 into CMAF chunks and authors
+a CMSF version-1 catalog (`packaging: "cmaf"`, root `initDataList`, per-track
+`initRef`; tracks named `vide_1` and `soun_2`). It publishes to
+moq-relay.red5.net over WebTransport on draft-16, the same dialect and draft
+gst-moq uses, so the public relay can be used directly.
 
-Setup: `pnpm --filter @moqt/example-node-relay gen-cert`, then
-`PORT=4443 pnpm --filter @moqt/example-node-relay relay-server`. Fixture from
-a 20 s synthetic clip (`ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 -f
-lavfi -i sine=frequency=440:sample_rate=48000 -t 20 -c:v libx264 -preset
-veryfast -g 30 -c:a aac -ac 2 -pix_fmt yuv420p fixtures/testsrc.mp4`), then
-`pnpm --filter @moqt/example-node-publisher prepare-fixture
-fixtures/testsrc.mp4 fixtures/testsrc 10 1000` (from
-`moq-playa/examples/node-publisher`), producing tracks `video-1080`,
-`video-720`, `video-360`, `audio-en`, `audio-es` under namespace `demo`.
-Published with `pnpm --filter @moqt/example-node-publisher publish-fixture
---loop --catalog-format cmsf-01 https://127.0.0.1:4443/moq fixtures/testsrc`.
-The relay log confirmed the publisher session and all five tracks were
-accepted.
+Source clip: a 120 s synthetic file (`ffmpeg -f lavfi -i
+testsrc2=size=640x360:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000
+-t 120 -c:v libx264 -profile:v baseline -g 30 -c:a aac -ac 2 ...`).
 
 ```sh
-GST_DEBUG=moqsrc:4 gst-launch-1.0 -v moqsrc host=127.0.0.1 port=4443 relay-path=/moq \
-    namespace=demo track-name=video-360 insecure=true draft=18 discovery-timeout=15000 \
-  ! qtdemux ! h264parse ! avdec_h264 ! fakesink -v
+./build/openmoq-publisher --input moqxr-test.mp4 --transport webtransport \
+    --endpoint https://moq-relay.red5.net:4433/moq --namespace gstinterop \
+    --draft 16 --forward 1 --publish-catalog --paced --loop
+GST_DEBUG=moqsrc:4 gst-launch-1.0 -v moqsrc host=moq-relay.red5.net port=4433 relay-path=/moq \
+    namespace=gstinterop track-name=vide_1 discovery-timeout=15000 \
+  ! qtdemux ! h264parse ! avdec_h264 ! fakesink silent=false
+GST_DEBUG=moqsrc:4 gst-launch-1.0 -v moqsrc host=moq-relay.red5.net port=4433 relay-path=/moq \
+    namespace=gstinterop track-name=soun_2 discovery-timeout=15000 \
+  ! qtdemux ! aacparse ! avdec_aac ! fakesink silent=false
 ```
 
-Both attempts failed identically and immediately:
+Both subscribers discovered both tracks from the catalog
+(`TRACK_ADDED name=vide_1 codec=avc1.42C01E packaging=cmaf`,
+`TRACK_ADDED name=soun_2 codec=mp4a.40.2 packaging=cmaf`), pushed the
+catalog init segment, and negotiated raw caps downstream of `qtdemux`. In a
+25 s run the video subscriber received 725 objects and `avdec_h264` produced
+725 frames (about 30 fps, 640x360); the audio subscriber received 5626
+objects and `avdec_aac` produced 5626 buffers (the relay delivers the cached
+backlog of the open group first, so the rate is above real time). No errors
+or warnings on either side.
 
-```
-moqsrc gstmoqsrc.c:547:gst_moq_src_create: error: media receiver failed (code=0)
-ERROR: from element .../GstMoqSrc:moqsrc0: Internal data stream error.
-ERROR: from element .../GstQTDemux:qtdemux0: This file contains no playable streams.
-```
+Two observations from this run:
 
-The relay's own log pinpoints it:
+- moqxr publishes the whole file as one MoQT group (group 0) with one CMAF
+  chunk per frame, so a late joiner receives only non-sync fragments until
+  the loop restarts; libmoq reports them as delta objects and `qtdemux` still
+  decodes because every fragment carries its own `moof`. This is a publisher
+  packaging choice, not a gst-moq concern.
+- The first subscriber started within a second of the publisher and saw only
+  one object in 20 s; every later run streamed normally. Start subscribers a
+  few seconds after the publisher.
 
-```
-[server] session ready — completing MoQT SETUP
-[server] onClose: code=135771101 reason=
-[server] session error: UniPairTopology: no inbound control stream
-```
-
-libmoq's WebTransport client opens its QUIC/WebTransport streams in a
-topology the Node relay's `UniPairTopology` handshake logic does not
-recognize as carrying an inbound control stream, so the relay closes the
-session before moqsrc subscribes to anything. This reproduced on both
-attempts with `insecure=true` and `draft=18` (the node-relay's only
-supported draft); it is not a gst-moq-side fragmentation or catalog issue —
-the publisher's own tracks were accepted by the relay, and moqsrc's stream
-handling is unchanged from the Task 5 native-subscriber path that works
-against moq-relay.red5.net. Open item: this interop path (libmoq client
-against Playa's example Node relay) needs a fix on one side of that stream
-topology mismatch; not pursued further here per the task's two-attempt limit.
+Playa's `node-publisher`/`node-relay` examples were tried first and cannot be
+used for this check: the node-publisher pins the relay certificate hash (so it
+cannot reach the public relay), and the node-relay is built on the current
+WebTransport draft while libmoq's picoquic backend speaks the drafts-13/14
+dialect, so the session closes before any MoQT control stream is exchanged
+(`UniPairTopology: no inbound control stream`).
 
 ### 6.4 Verified results
 
@@ -288,7 +286,8 @@ topology mismatch; not pursued further here per the task's two-attempt limit.
 | moqsrc, track-name=video (AAC run) | h264parse/avdec_h264 | caps negotiated, 640x360 | 0 | n/a |
 | moqsrc, track-name=video (Opus run) | h264parse/avdec_h264 | caps negotiated, 640x360 | 0 | n/a |
 | moqsrc, track-name=audio (Opus run) | qtdemux/opusdec | caps negotiated, 48kHz stereo | 0 | n/a |
-| Node-publisher/node-relay interop | — | not reached | `UniPairTopology: no inbound control stream` | — |
+| moqsrc, moqxr CMSF-01 publisher, track vide_1 | qtdemux/avdec_h264 | 725 objects, 725 frames in 25 s, 640x360 | 0 | n/a |
+| moqsrc, moqxr CMSF-01 publisher, track soun_2 | qtdemux/avdec_aac | 5626 objects, 5626 buffers in 25 s | 0 | n/a |
 
 Screenshots (not included in this doc): the AAC run showed the Playa player's
 `<video>` element visibly playing the 640x360 ball test pattern with the
