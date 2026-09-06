@@ -66,8 +66,9 @@ width, height and framerate from the caps.
 Common properties: `host`, `port`, `relay-path`, `namespace`, `track-name`,
 `insecure` (skip TLS verification — test only), `draft` (MoQ Transport draft to
 negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
-`codec` (override the derived catalog codec string) and `bitrate`; `moqsrc`
-requires `caps` and adds `latency` (ms reported to the pipeline, default 200).
+`codec` (override the derived catalog codec string), `bitrate`, `sync`,
+`sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout` and
+`caps`, which is now optional — it is derived from the catalog when omitted.
 
 `moqsrc` maps LOC presentation times onto the pipeline clock: the first object
 is anchored at the running time of its arrival and later objects keep their
@@ -78,12 +79,43 @@ bridge draft-16 and draft-18 sessions have been seen to forward the LOC
 property block verbatim, and the two drafts encode its integers differently
 (QUIC varint vs vi64), so a cross-draft subscriber rejects the objects.
 
+### CMAF (fragmented MP4) with audio
+
+`moqsink` also takes fragmented MP4 on request pads `video_%u` and `audio_%u`
+and publishes each as a CMAF track under one CMSF-01 catalog (`packaging:
+"cmaf"`, root `initDataList`, per-track `initRef`). Feed each pad from its own
+fragmented muxer; one moof+mdat fragment becomes one MoQ object, and a
+fragment starting on a sync sample opens a new group, so keep
+`fragment-duration` a multiple of the GOP length.
+
+```sh
+gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace=example \
+  videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse \
+    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.video_0 \
+  audiotestsrc is-live=true ! voaacenc ! aacparse \
+    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.audio_0
+```
+
+Opus works the same way (`opusenc ! opusparse ! mp4mux ...`). Pad properties
+`track-name` and `bitrate` set the catalog entry per pad (`ms.video_0::track-name=hd`).
+Element property `sap-timeline` adds a CMSF SAP event timeline track per CMAF track.
+
+Play a CMAF track back with `qtdemux`; `caps` is derived from the catalog:
+
+```sh
+gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=video \
+  ! qtdemux ! h264parse ! avdec_h264 ! autovideosink
+gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=audio \
+  ! qtdemux ! aacparse ! avdec_aac ! autoaudiosink
+```
+
 ## Status
 
 H.264 byte-stream over WebTransport, validated end to end through a MoQ relay
 with both `moqsrc` and the Red5 Playa browser player (draft-16 and draft-18).
-Opus audio, a self-describing catalog (so `moqsrc` needs no `caps`), and a
-raw-QUIC (`moqt://`) transport option are follow-ups.
+CMAF (fragmented MP4) video plus AAC or Opus audio under a CMSF-01 catalog is
+validated the same way, with `moqsrc` deriving caps from the catalog. A
+raw-QUIC (`moqt://`) transport option is a follow-up.
 
 ## Author
 

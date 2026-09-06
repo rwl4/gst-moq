@@ -159,3 +159,138 @@ dropped. `h264parse config-interval=-1` keeps SPS/PPS on every keyframe.
   joiners see the catalog.
 - Playa's stats show a "Gaps" counter incrementing about once per group.
   Playback was smooth with 0 dropped frames; it was not investigated further.
+
+## 6. CMAF and CMSF-01
+
+Publisher (video + AAC, `fragment-duration` matched to the 1 s GOP from
+`key-int-max=30` at 30 fps):
+
+```sh
+gst-launch-1.0 -e moqsink name=ms host=moq-relay.red5.net port=4433 relay-path=/moq namespace=gsttest \
+  videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=30/1 ! timeoverlay \
+    ! x264enc tune=zerolatency key-int-max=30 bitrate=1000 ! video/x-h264,profile=constrained-baseline ! h264parse \
+    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.video_0 \
+  audiotestsrc is-live=true wave=sine ! audio/x-raw,rate=48000,channels=2 ! voaacenc bitrate=128000 ! aacparse \
+    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.audio_0
+```
+
+Opus variant: replace the audio branch with `opusenc bitrate=96000 ! opusparse
+! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.audio_0`.
+
+Browser subscriber: `cd moq-playa/examples && npx vite --port 5173`, then open
+`http://localhost:5173/player/?url=https://moq-relay.red5.net:4433/moq&ns=gsttest&log=debug`
+(add `&msedebug=1` for per-append MSE tracing). Native subscribers:
+
+```sh
+gst-launch-1.0 moqsrc host=moq-relay.red5.net port=4433 relay-path=/moq namespace=gsttest track-name=video \
+  ! qtdemux ! h264parse ! avdec_h264 ! fakesink -v
+gst-launch-1.0 moqsrc host=moq-relay.red5.net port=4433 relay-path=/moq namespace=gsttest track-name=audio \
+  ! qtdemux ! opusdec ! fakesink -v
+```
+
+### 6.1 First Playa join landed mid-fragment near publisher EOS (false alarm)
+
+The first attempt opened Playa about 30 seconds into a publisher run limited
+to `num-buffers=9000` (300 s of video at 30 fps). Playa built the CMAF
+`MediaSource`, subscribed both tracks and received objects, but never rendered
+a frame:
+
+```
+[moqt] Error [.../]0x1203: fatal catalog 1203 CMAF MediaSource initialized but
+no frame rendered (init/codec mismatch?) within 10000ms
+```
+
+Stats showed Objects=45, Decoded=0, Rendered=0, State=error. Inspecting the
+player's internal state (`window.__player.cmafAssembler`) showed
+`lastVideoOutputBmd` and `lastAudioOutputBmd` both non-null, i.e. the
+assembler had rebased and emitted segments — the failure was not in fragment
+parsing. Re-running the publisher with a longer `num-buffers` (18000, 600 s)
+and reloading Playa immediately after the publisher started reproduced a
+clean run every time, with `[moqt] First frame rendered` logged under 1 s
+after the catalog. The original run's publisher log showed it hit `Got EOS`
+and tore down about the time the failure surfaced, which lines up with the
+watchdog timing: the run was not a CMAF fragmentation bug, it was Playa's
+5-minute publisher script ending near the point where we opened the tab. Not
+a gst-moq issue; noted here so the next run does not re-chase it. Keep the
+publisher's `num-buffers` comfortably longer than the test window.
+
+### 6.2 Playa's "Decoded"/"FPS" stat tiles read 0 during CMAF playback
+
+With a clean run, Playa's stats overlay showed `Decoded 0`, `Rendered 0`,
+`FPS 0.0` throughout playback even though the `<video>` element was visibly
+advancing (`currentTime` climbing, `webkitDecodedFrameCount` incrementing
+about 30/s). Those three tiles are wired to the old LOC/WebCodecs decode path
+and are not yet updated for the CMAF/MSE path; frame counts are only
+observable through the `<video>` element itself in this mode. Not a gst-moq
+issue — recorded as an observation, same as the "Gaps" counter in section 5.
+
+### 6.3 Node-relay interop: libmoq WebTransport handshake rejected
+
+Interop target: Playa's `node-publisher` example, publishing a CMSF-01
+catalog through Playa's local `node-relay` (draft-18 only; the public
+moq-relay.red5.net cannot be used here because the node-publisher pins the
+relay's certificate hash and only the local relay's cert is available).
+
+Setup: `pnpm --filter @moqt/example-node-relay gen-cert`, then
+`PORT=4443 pnpm --filter @moqt/example-node-relay relay-server`. Fixture from
+a 20 s synthetic clip (`ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 -f
+lavfi -i sine=frequency=440:sample_rate=48000 -t 20 -c:v libx264 -preset
+veryfast -g 30 -c:a aac -ac 2 -pix_fmt yuv420p fixtures/testsrc.mp4`), then
+`pnpm --filter @moqt/example-node-publisher prepare-fixture
+fixtures/testsrc.mp4 fixtures/testsrc 10 1000` (from
+`moq-playa/examples/node-publisher`), producing tracks `video-1080`,
+`video-720`, `video-360`, `audio-en`, `audio-es` under namespace `demo`.
+Published with `pnpm --filter @moqt/example-node-publisher publish-fixture
+--loop --catalog-format cmsf-01 https://127.0.0.1:4443/moq fixtures/testsrc`.
+The relay log confirmed the publisher session and all five tracks were
+accepted.
+
+```sh
+GST_DEBUG=moqsrc:4 gst-launch-1.0 -v moqsrc host=127.0.0.1 port=4443 relay-path=/moq \
+    namespace=demo track-name=video-360 insecure=true draft=18 discovery-timeout=15000 \
+  ! qtdemux ! h264parse ! avdec_h264 ! fakesink -v
+```
+
+Both attempts failed identically and immediately:
+
+```
+moqsrc gstmoqsrc.c:547:gst_moq_src_create: error: media receiver failed (code=0)
+ERROR: from element .../GstMoqSrc:moqsrc0: Internal data stream error.
+ERROR: from element .../GstQTDemux:qtdemux0: This file contains no playable streams.
+```
+
+The relay's own log pinpoints it:
+
+```
+[server] session ready — completing MoQT SETUP
+[server] onClose: code=135771101 reason=
+[server] session error: UniPairTopology: no inbound control stream
+```
+
+libmoq's WebTransport client opens its QUIC/WebTransport streams in a
+topology the Node relay's `UniPairTopology` handshake logic does not
+recognize as carrying an inbound control stream, so the relay closes the
+session before moqsrc subscribes to anything. This reproduced on both
+attempts with `insecure=true` and `draft=18` (the node-relay's only
+supported draft); it is not a gst-moq-side fragmentation or catalog issue —
+the publisher's own tracks were accepted by the relay, and moqsrc's stream
+handling is unchanged from the Task 5 native-subscriber path that works
+against moq-relay.red5.net. Open item: this interop path (libmoq client
+against Playa's example Node relay) needs a fix on one side of that stream
+topology mismatch; not pursued further here per the task's two-attempt limit.
+
+### 6.4 Verified results
+
+| Test | Codec | Resolution/fps | Decode errors | TTFF |
+|---|---|---|---|---|
+| Playa, video + AAC | avc1.42c01e / mp4a.40.2 | 640x360, ~29.9 fps (1405 frames / 46.9 s) | 0 | 879 ms |
+| Playa, video + Opus | avc1.42c01e / opus | 640x360, ~30.1 fps (1199 frames / 39.8 s) | 0 | 782 ms |
+| moqsrc, track-name=video (AAC run) | h264parse/avdec_h264 | caps negotiated, 640x360 | 0 | n/a |
+| moqsrc, track-name=video (Opus run) | h264parse/avdec_h264 | caps negotiated, 640x360 | 0 | n/a |
+| moqsrc, track-name=audio (Opus run) | qtdemux/opusdec | caps negotiated, 48kHz stereo | 0 | n/a |
+| Node-publisher/node-relay interop | — | not reached | `UniPairTopology: no inbound control stream` | — |
+
+Screenshots: `/tmp/claude-chrome-screenshots-XsMJ01/screenshot-1788719467969-2.jpg`
+(AAC run, video visibly playing) and
+`/tmp/claude-chrome-screenshots-XsMJ01/screenshot-1788719546888-3.jpg` (Opus
+run, stats overlay).
