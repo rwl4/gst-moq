@@ -34,9 +34,12 @@ struct _GstMoqSinkPad
   GstSegment         segment;
   GstClockID         clock_id;   /* pending sync wait, under OBJECT_LOCK */
 
-  /* LOC (always pad) */
+  /* LOC (always pads) */
   GstClockTime base_pts;
-  gint width, height, fps_n, fps_d;
+  gint width, height, fps_n, fps_d;   /* video */
+  gint rate, channels;                /* audio */
+  GBytes *codec_data;                 /* audio: AudioSpecificConfig from caps */
+  GstClockTime group_start;           /* audio: start of the open group */
 
   /* CMAF (request pads) */
   GstMoqFmp4Splitter   splitter;

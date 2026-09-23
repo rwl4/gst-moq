@@ -69,6 +69,12 @@ GST_DEBUG_CATEGORY_STATIC (gst_moq_sink_debug);
 #define DEFAULT_DRAFT      16            /* browsers (playa) default to draft-16; 0 = offer all */
 #define DEFAULT_BITRATE    2000000       /* catalog max bitrate (MSF-01 §5.2.22) */
 #define DEFAULT_AUDIO_BITRATE 128000
+#define DEFAULT_AUDIO_TRACK_NAME "audio"
+/* LOC audio group cadence. Every AAC frame is independently decodable, so any
+ * object could open a group; one group per ~21 ms frame would give a relay ~47
+ * groups/s per track. A group per second matches both the video path's usual
+ * GOP cadence and what the CMAF path produces (one fragment, one group). */
+#define LOC_AUDIO_GROUP_US 1000000
 #define DEFAULT_MAX_FRAGMENT (16u << 20)
 
 typedef struct {
@@ -131,7 +137,8 @@ struct _GstMoqSink
   moq_bytes_t *ns_bytes;
   guint        ns_count;
 
-  GstMoqSinkPad *locpad;    /* the always pad */
+  GstMoqSinkPad *locpad;        /* the always video (H.264) pad */
+  GstMoqSinkPad *locpad_audio;  /* the always audio (AAC) pad */
   guint          pad_serial;
 };
 
@@ -142,6 +149,15 @@ GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("video/x-h264, "
         "stream-format = (string) byte-stream, "
         "alignment = (string) au"));
+
+/* The second always pad: AAC access units, one LOC object per frame. Raw AAC
+ * (no ADTS) because LOC carries the decoder config out of band, in the
+ * catalog's initData, exactly as the video pad carries avcC there. */
+static GstStaticPadTemplate audio_loc_template =
+GST_STATIC_PAD_TEMPLATE ("audio", GST_PAD_SINK, GST_PAD_ALWAYS,
+    GST_STATIC_CAPS ("audio/mpeg, "
+        "mpeg-version = (int) 4, "
+        "stream-format = (string) raw"));
 
 static GstStaticPadTemplate video_template =
 GST_STATIC_PAD_TEMPLATE ("video_%u", GST_PAD_SINK, GST_PAD_REQUEST,
@@ -427,6 +443,76 @@ gst_moq_sink_set_pad_flush (GstMoqSink *self, GstMoqSinkPad *pad, gboolean pendi
 
 /* -- LOC path (always pad) ----------------------------------------------- */
 
+/* Register the LOC audio track. Unlike video there is nothing to scavenge from
+ * the payload: AAC access units carry no in-band config, so everything comes
+ * from the caps (codec_data = AudioSpecificConfig), which GStreamer guarantees
+ * before the first buffer. */
+static gboolean
+gst_moq_sink_add_loc_audio_track (GstMoqSink *self, GstMoqSinkPad *pad)
+{
+  gsize asc_len = 0;
+  const guint8 *asc = pad->codec_data
+      ? g_bytes_get_data (pad->codec_data, &asc_len) : NULL;
+  gchar *codec = asc ? gst_moq_codec_string_from_aac_asc (asc, asc_len) : NULL;
+  if (!codec) {
+    GST_ELEMENT_ERROR (self, STREAM, CODEC_NOT_FOUND,
+        ("no usable AudioSpecificConfig on pad %s; feed the LOC audio pad from "
+            "aacparse with raw AAC caps (stream-format=raw)",
+            GST_PAD_NAME (pad)), (NULL));
+    return FALSE;
+  }
+  if (pad->rate <= 0 || pad->channels <= 0) {
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+        ("audio caps on pad %s carry no rate/channels; MSF-01 5.2.28 and "
+            "5.2.29 make both mandatory for an audio track",
+            GST_PAD_NAME (pad)), (NULL));
+    g_free (codec);
+    return FALSE;
+  }
+  gchar *chan_cfg = g_strdup_printf ("%d", pad->channels);
+
+  moq_media_track_cfg_t tc;
+  moq_media_track_cfg_init (&tc);
+  tc.name.data = (const uint8_t *) pad->track_name;
+  tc.name.len = strlen (pad->track_name);
+  tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+  tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+  tc.codec.data = (const uint8_t *) codec;
+  tc.codec.len = strlen (codec);
+  tc.is_live = TRUE;
+  tc.bitrate = pad->bitrate;
+  tc.samplerate = (uint32_t) pad->rate;
+  tc.channel_config.data = (const uint8_t *) chan_cfg;
+  tc.channel_config.len = strlen (chan_cfg);
+  /* The ASC is this track's decoder config, so it belongs in initData for the
+   * same reason avcC does on the video pad: a subscriber cannot configure a
+   * decoder from the access units alone. */
+  tc.init_data.data = asc;
+  tc.init_data.len = asc_len;
+
+  g_mutex_lock (&self->send_lock);
+  if (!self->sender) {
+    g_mutex_unlock (&self->send_lock);
+    g_free (codec);
+    g_free (chan_cfg);
+    return FALSE;
+  }
+  moq_result_t rc = moq_media_sender_add_track (self->sender, &tc, &pad->track);
+  g_mutex_unlock (&self->send_lock);
+  if (rc != MOQ_OK) {
+    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
+        ("could not add LOC audio track \"%s\" (rc=%d)", pad->track_name,
+            (int) rc), (NULL));
+  } else {
+    GST_INFO_OBJECT (pad, "added LOC track %s codec=%s sr=%d ch=%d "
+        "initData=%" G_GSIZE_FORMAT " B", pad->track_name, codec, pad->rate,
+        pad->channels, asc_len);
+  }
+  g_free (codec);
+  g_free (chan_cfg);
+  return rc == MOQ_OK;
+}
+
 static gboolean
 gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
     const guint8 *au, gsize au_len)
@@ -530,14 +616,21 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
     return GST_FLOW_ERROR;
   }
 
-  gboolean keyframe = !GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+  gboolean audio = pad->media_type == MOQ_MEDIA_TYPE_AUDIO;
+  /* Every AAC access unit is independently decodable, so an audio object is
+   * always a sync point; video waits for a real keyframe. */
+  gboolean keyframe = audio ||
+      !GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
   if (!pad->track) {
     if (!keyframe) {
       GST_LOG_OBJECT (pad, "dropping delta frame before the first keyframe");
       sink_frame_free (f);
       return GST_FLOW_OK;
     }
-    if (!gst_moq_sink_add_loc_track (self, pad, f->map.data, f->map.size)) {
+    gboolean added = audio
+        ? gst_moq_sink_add_loc_audio_track (self, pad)
+        : gst_moq_sink_add_loc_track (self, pad, f->map.data, f->map.size);
+    if (!added) {
       sink_frame_free (f);
       return GST_FLOW_ERROR;
     }
@@ -563,12 +656,22 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
     return GST_FLOW_ERROR;
   }
 
+  gboolean starts_group = keyframe;
+  if (audio) {
+    /* Bound the group length in time rather than opening one per frame. */
+    if (!GST_CLOCK_TIME_IS_VALID (pad->group_start) ||
+        pts_us >= pad->group_start + LOC_AUDIO_GROUP_US)
+      pad->group_start = pts_us;
+    else
+      starts_group = FALSE;
+  }
+
   moq_media_send_object_t o;
   memset (&o, 0, sizeof o);
   o.struct_size = sizeof o;
   o.payload = payload;
   o.is_sync = keyframe;
-  o.starts_group = keyframe;
+  o.starts_group = starts_group;
   o.decode_time_us = dts_us;
   o.presentation_time_us = pts_us;
 
@@ -992,6 +1095,34 @@ gst_moq_sink_event (GstPad *gpad, GstObject *parent, GstEvent *event)
       gst_structure_get_int (st, "width", &pad->width);
       gst_structure_get_int (st, "height", &pad->height);
       gst_structure_get_fraction (st, "framerate", &pad->fps_n, &pad->fps_d);
+      if (pad->media_type == MOQ_MEDIA_TYPE_AUDIO &&
+          pad->packaging == MOQ_MEDIA_PACKAGING_RAW) {
+        pad->rate = pad->channels = 0;
+        gst_structure_get_int (st, "rate", &pad->rate);
+        gst_structure_get_int (st, "channels", &pad->channels);
+        g_clear_pointer (&pad->codec_data, g_bytes_unref);
+        const GValue *cd = gst_structure_get_value (st, "codec_data");
+        if (cd && GST_VALUE_HOLDS_BUFFER (cd)) {
+          GstBuffer *cdbuf = gst_value_get_buffer (cd);
+          GstMapInfo m;
+          if (gst_buffer_map (cdbuf, &m, GST_MAP_READ)) {
+            pad->codec_data = g_bytes_new (m.data, m.size);
+            gst_buffer_unmap (cdbuf, &m);
+          }
+        }
+        /* The catalog's samplerate/channelConfig are REQUIRED for an audio
+         * track (MSF-01 5.2.28/5.2.29) and libmoq rejects the track without
+         * them, so fall back to the ASC when the caps omit either. */
+        if ((pad->rate == 0 || pad->channels == 0) && pad->codec_data) {
+          gsize n;
+          const guint8 *asc = g_bytes_get_data (pad->codec_data, &n);
+          gint r = 0, c = 0;
+          if (gst_moq_codec_aac_asc_params (asc, n, &r, &c)) {
+            if (pad->rate == 0) pad->rate = r;
+            if (pad->channels == 0) pad->channels = c;
+          }
+        }
+      }
       GST_DEBUG_OBJECT (pad, "caps %" GST_PTR_FORMAT, caps);
       break;
     }
@@ -1528,6 +1659,8 @@ gst_moq_sink_class_init (GstMoqSinkClass *klass)
   gst_element_class_add_static_pad_template_with_gtype (element_class,
       &sink_template, GST_TYPE_MOQ_SINK_PAD);
   gst_element_class_add_static_pad_template_with_gtype (element_class,
+      &audio_loc_template, GST_TYPE_MOQ_SINK_PAD);
+  gst_element_class_add_static_pad_template_with_gtype (element_class,
       &video_template, GST_TYPE_MOQ_SINK_PAD);
   gst_element_class_add_static_pad_template_with_gtype (element_class,
       &audio_template, GST_TYPE_MOQ_SINK_PAD);
@@ -1564,6 +1697,15 @@ gst_moq_sink_init (GstMoqSink *self)
   gst_pad_set_chain_function (GST_PAD (self->locpad), gst_moq_sink_chain);
   gst_pad_set_event_function (GST_PAD (self->locpad), gst_moq_sink_event);
   gst_element_add_pad (GST_ELEMENT (self), GST_PAD (self->locpad));
+
+  templ = gst_static_pad_template_get (&audio_loc_template);
+  self->locpad_audio = gst_moq_sink_pad_new (templ, "audio",
+      MOQ_MEDIA_TYPE_AUDIO, MOQ_MEDIA_PACKAGING_RAW, DEFAULT_AUDIO_TRACK_NAME,
+      DEFAULT_AUDIO_BITRATE, DEFAULT_MAX_FRAGMENT);
+  gst_object_unref (templ);
+  gst_pad_set_chain_function (GST_PAD (self->locpad_audio), gst_moq_sink_chain);
+  gst_pad_set_event_function (GST_PAD (self->locpad_audio), gst_moq_sink_event);
+  gst_element_add_pad (GST_ELEMENT (self), GST_PAD (self->locpad_audio));
 
   GST_OBJECT_FLAG_SET (self, GST_ELEMENT_FLAG_SINK);
 }

@@ -52,6 +52,7 @@ gst_moq_sink_pad_finalize (GObject *object)
   g_free (pad->track_name);
   gst_moq_fmp4_splitter_clear (&pad->splitter);
   g_clear_pointer (&pad->init, g_bytes_unref);
+  g_clear_pointer (&pad->codec_data, g_bytes_unref);
   G_OBJECT_CLASS (gst_moq_sink_pad_parent_class)->finalize (object);
 }
 
@@ -91,6 +92,7 @@ gst_moq_sink_pad_reset (GstMoqSinkPad *pad)
   pad->flush_pending = FALSE;
   pad->objects_sent = 0;
   pad->base_pts = GST_CLOCK_TIME_NONE;
+  pad->group_start = GST_CLOCK_TIME_NONE;
   gsize max_box = pad->splitter.max_box;
   gst_moq_fmp4_splitter_clear (&pad->splitter);
   gst_moq_fmp4_splitter_init (&pad->splitter, max_box);

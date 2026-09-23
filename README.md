@@ -92,6 +92,38 @@ bridge draft-16 and draft-18 sessions have been seen to forward the LOC
 property block verbatim, and the two drafts encode its integers differently
 (QUIC varint vs vi64), so a cross-draft subscriber rejects the objects.
 
+### LOC with audio
+
+The always pads are `sink` (H.264 byte-stream) and `audio` (raw AAC access
+units). Each publishes a LOC-01 track into the same catalog, so a LOC broadcast
+can carry video and audio:
+
+```sh
+gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace=example \
+  videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse config-interval=-1 \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! ms.sink \
+  audiotestsrc is-live=true ! voaacenc ! aacparse \
+    ! audio/mpeg,mpeg-version=4,stream-format=raw ! ms.audio
+```
+
+The audio pad wants **raw** AAC, not ADTS: the decoder config travels in the
+catalog's `initData`, taken from the caps' `codec_data`, exactly as the video
+pad publishes avcC there. `rate` and `channels` become the catalog's
+`samplerate` and `channelConfig`, which MSF-01 §5.2.28/§5.2.29 make mandatory
+for an audio track — the element reads them from the caps and falls back to the
+AudioSpecificConfig. Every AAC frame is a sync point, so objects are never
+dropped waiting for a keyframe; groups are cut on a one-second budget rather
+than one per frame, matching the video GOP cadence. The element's `track-name`
+and `bitrate` properties apply to the video pad; the audio pad carries its own
+(`ms.audio::track-name=...`), defaulting to `audio`.
+
+Play it back with `moqsrc`, which derives AAC caps from the catalog:
+
+```sh
+gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=audio \
+  ! aacparse ! avdec_aac ! autoaudiosink
+```
+
 ### CMAF (fragmented MP4) with audio
 
 `moqsink` also takes fragmented MP4 on request pads `video_%u` and `audio_%u`
@@ -124,14 +156,17 @@ gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example tra
 
 ## Status
 
-The plugin supports H.264 Annex B LOC publishing and CMAF video/audio under a
-CMSF-01 catalog. CMAF codec strings cover AVC, AAC and Opus; automatic LOC
-receiver caps cover H.264 only. Finite draft-16 LOC plus CMAF/AAC delivery,
-independent track EOS and publisher drain passed through the Chicago and London
-moqx relays with the exact private SDK described below. Separately captured
-CMAF AVC/AAC from Playa decoded offline. These results do not qualify arbitrary
-LOC framing, Opus playback, draft-18 finite EOS or every relay implementation.
-A raw-QUIC (`moqt://`) transport option is a follow-up.
+The plugin supports H.264 Annex B LOC publishing, LOC AAC audio on a second
+always pad, and CMAF video/audio under a CMSF-01 catalog. CMAF codec strings
+cover AVC, AAC and Opus; automatic LOC receiver caps cover H.264 and AAC.
+Finite draft-16 LOC plus CMAF/AAC delivery, independent track EOS and publisher
+drain passed through the Chicago and London moqx relays with the exact private
+SDK described below. Separately captured CMAF AVC/AAC from Playa decoded
+offline. LOC video-plus-audio publishing, and `moqsrc` decoding the audio track
+back, were validated against `moq-relay.red5.net` on draft-16 only. These
+results do not qualify arbitrary LOC framing, Opus playback, draft-18 finite
+EOS or every relay implementation. A raw-QUIC (`moqt://`) transport option is a
+follow-up.
 
 ## Author
 
