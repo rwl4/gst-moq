@@ -41,6 +41,9 @@ struct _GstMoqSinkPad
   gboolean avc;                       /* video: length-prefixed, not Annex B */
   GBytes *codec_data;                 /* audio: AudioSpecificConfig from caps */
   GstClockTime group_start;           /* audio: start of the open group */
+  /* audio: the video group-start PTS this pad has already aligned to, so each
+   * video group opens exactly one audio group (see gst_moq_sink_chain_loc). */
+  GstClockTime aligned_to_video_pts;
 
   /* Initial-catalog barrier. Everything moq_media_sender_add_track needs is
    * derived at this pad's first keyframe and stashed here, so the sender can be

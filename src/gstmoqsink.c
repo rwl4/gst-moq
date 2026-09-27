@@ -168,6 +168,13 @@ struct _GstMoqSink
   gboolean     tracks_committed;
   gboolean     tracks_failed;
 
+  /* Raw PTS of the most recent VIDEO group start, published so the audio pad
+   * can open its group at the same instant (see gst_moq_sink_chain_loc).
+   * Compared by identity only -- the two pads rebase presentation time
+   * separately, so magnitudes are not comparable across them. Guarded by
+   * OBJECT_LOCK. */
+  GstClockTime loc_video_group_pts;
+
   gboolean     loc_anchored;
   gint64       loc_anchor_epoch_us;
   GstClockTime loc_anchor_pts;
@@ -951,12 +958,37 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
 
   gboolean starts_group = keyframe;
   if (audio) {
-    /* Bound the group length in time rather than opening one per frame. */
-    if (!GST_CLOCK_TIME_IS_VALID (pad->group_start) ||
-        pts_us >= pad->group_start + (guint64) self->loc_audio_group_ms * 1000)
+    /* Open an audio group at every VIDEO group start (keyframe), so both
+     * tracks are joinable at the same instant. A subscriber starts each track
+     * at that track's next group boundary, and the two cadences are otherwise
+     * unrelated (video = GOP, audio = a fixed period), so their join points
+     * drift against each other: measured on this pipeline, audio arrived up to
+     * a full audio-period after video, and a player that cannot start video
+     * before it has an audio reference then renders nothing at all. Aligning
+     * collapses that gap to network jitter.
+     *
+     * loc-audio-group-ms stays as an UPPER bound so audio still opens groups
+     * when video stalls or is absent (audio-only). An extra boundary between
+     * keyframes is harmless here: it only makes audio available EARLIER, which
+     * is the safe direction. */
+    GST_OBJECT_LOCK (self);
+    GstClockTime vgrp = self->loc_video_group_pts;
+    GST_OBJECT_UNLOCK (self);
+
+    if (GST_CLOCK_TIME_IS_VALID (vgrp) && vgrp != pad->aligned_to_video_pts) {
+      pad->aligned_to_video_pts = vgrp;   /* one audio group per video group */
       pad->group_start = pts_us;
-    else
+    } else if (!GST_CLOCK_TIME_IS_VALID (pad->group_start) ||
+               pts_us >= pad->group_start + (guint64) self->loc_audio_group_ms * 1000) {
+      pad->group_start = pts_us;
+    } else {
       starts_group = FALSE;
+    }
+  } else if (starts_group && GST_CLOCK_TIME_IS_VALID (pts)) {
+    /* Publish this video group start for the audio pad to align to. */
+    GST_OBJECT_LOCK (self);
+    self->loc_video_group_pts = pts;
+    GST_OBJECT_UNLOCK (self);
   }
 
   moq_media_send_object_t o;
@@ -1609,6 +1641,7 @@ gst_moq_sink_start (GstMoqSink *self)
   self->eos_posted = FALSE;
   self->eos_failed = FALSE;
   self->loc_anchored = FALSE;
+  self->loc_video_group_pts = GST_CLOCK_TIME_NONE;
   GST_OBJECT_LOCK (self);
   self->flush_count = 0;
   self->state_flushing = FALSE;
@@ -2108,6 +2141,7 @@ gst_moq_sink_init (GstMoqSink *self)
   self->catalog_refresh_ms = 0;
   self->catalog_wait_ms = DEFAULT_CATALOG_WAIT_MS;
   self->loc_audio_group_ms = LOC_AUDIO_GROUP_US / 1000;
+  self->loc_video_group_pts = GST_CLOCK_TIME_NONE;
   self->latency = 0;
   g_mutex_init (&self->send_lock);
   g_mutex_init (&self->track_lock);

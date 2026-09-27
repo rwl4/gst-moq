@@ -96,6 +96,7 @@ gst_moq_sink_pad_reset (GstMoqSinkPad *pad)
   pad->objects_sent = 0;
   pad->base_pts = GST_CLOCK_TIME_NONE;
   pad->group_start = GST_CLOCK_TIME_NONE;
+  pad->aligned_to_video_pts = GST_CLOCK_TIME_NONE;
   pad->pend_ready = FALSE;
   g_clear_pointer (&pad->pend_codec, g_free);
   g_clear_pointer (&pad->pend_avcc, g_bytes_unref);
