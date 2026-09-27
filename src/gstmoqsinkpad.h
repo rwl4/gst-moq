@@ -38,8 +38,19 @@ struct _GstMoqSinkPad
   GstClockTime base_pts;
   gint width, height, fps_n, fps_d;   /* video */
   gint rate, channels;                /* audio */
+  gboolean avc;                       /* video: length-prefixed, not Annex B */
   GBytes *codec_data;                 /* audio: AudioSpecificConfig from caps */
   GstClockTime group_start;           /* audio: start of the open group */
+
+  /* Initial-catalog barrier. Everything moq_media_sender_add_track needs is
+   * derived at this pad's first keyframe and stashed here, so the sender can be
+   * attached only once EVERY linked pad has one and all tracks can be added
+   * before the session establishes -- otherwise a pad whose caps arrive late is
+   * absent from the initial catalog (see gst_moq_sink_await_tracks). */
+  gboolean pend_ready;
+  gchar   *pend_codec;                /* LOC: codec string (owned) */
+  GBytes  *pend_avcc;                 /* LOC video: avcC (owned) */
+  gchar   *pend_chan;                 /* LOC audio: channelConfig (owned) */
 
   /* CMAF (request pads) */
   GstMoqFmp4Splitter   splitter;
