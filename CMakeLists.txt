@@ -87,7 +87,9 @@ set_target_properties(gstmoq PROPERTIES
     OUTPUT_NAME "gstmoq"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins")
 
-# Unit tests: plain GLib executables, no GStreamer pipeline, no network.
+# Unit tests: no relay and no socket in any of them. The first two are plain
+# GLib executables over a single source file; test_track_barrier drives the real
+# moqsink element and so links GStreamer, faking libmoq at the link seam.
 include(CTest)
 if(BUILD_TESTING)
     pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
@@ -127,6 +129,56 @@ if(BUILD_TESTING)
     target_link_libraries(test_codec_string PRIVATE PkgConfig::GLIB moq::cmaf moq::core)
     target_compile_options(test_codec_string PRIVATE -Wall -Wextra)
     add_test(NAME codec_string COMMAND test_codec_string)
+
+    # The track barrier drives the real moqsink element, so this one needs
+    # GStreamer -- but still no relay and no socket: the libmoq entry points the
+    # barrier reaches are replaced at link time with --wrap, and the test
+    # supplies the handles. Keep the wrap list in sync with the libmoq calls on
+    # the attach/add_track/write path in gstmoqsink.c.
+    #
+    # --wrap is a GNU ld / lld feature; Apple's linker has no equivalent, so the
+    # target is skipped where the flag does not link rather than breaking the
+    # build. The barrier itself is platform-independent, so losing the test on
+    # macOS costs coverage, not correctness.
+    include(CheckLinkerFlag)
+    check_linker_flag(C "-Wl,--wrap=moq_endpoint_connect" HAVE_LD_WRAP)
+
+    if(HAVE_LD_WRAP)
+    add_executable(test_track_barrier
+        tests/test_track_barrier.c
+        src/gstmoqsink.c
+        src/gstmoqsinkpad.c
+        src/gstmoqfmp4.c
+        src/gstmoqcodec.c)
+    target_include_directories(test_track_barrier PRIVATE src)
+    target_link_libraries(test_track_barrier PRIVATE
+        PkgConfig::GST
+        PkgConfig::GLIB
+        moq::service
+        moq::media-object
+        moq::loc
+        moq::cmaf
+        moq::msf
+        moq::core)
+    target_compile_options(test_track_barrier PRIVATE -Wall -Wextra)
+    target_link_options(test_track_barrier PRIVATE
+        -Wl,--wrap=moq_endpoint_connect
+        -Wl,--wrap=moq_endpoint_stop
+        -Wl,--wrap=moq_endpoint_destroy
+        -Wl,--wrap=moq_endpoint_set_interrupted
+        -Wl,--wrap=moq_endpoint_drain
+        -Wl,--wrap=moq_media_sender_attach
+        -Wl,--wrap=moq_media_sender_add_track
+        -Wl,--wrap=moq_media_sender_write
+        -Wl,--wrap=moq_media_sender_end_track
+        -Wl,--wrap=moq_media_sender_is_fatal
+        -Wl,--wrap=moq_media_sender_fatal_code
+        -Wl,--wrap=moq_media_sender_get_stats
+        -Wl,--wrap=moq_media_sender_destroy)
+    add_test(NAME track_barrier COMMAND test_track_barrier)
+    else()
+        message(STATUS "gst-moq: linker has no --wrap; skipping track_barrier test")
+    endif()
 
     add_test(NAME smoke
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh ${CMAKE_BINARY_DIR}/plugins)
