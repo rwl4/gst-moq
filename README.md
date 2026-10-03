@@ -66,13 +66,22 @@ width, height and framerate from the caps.
 Common properties: `host`, `port`, `relay-path`, `namespace`, `track-name`,
 `insecure` (skip TLS verification — test only), `draft` (MoQ Transport draft to
 negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
-`codec` (override the derived catalog codec string) and `bitrate`; `moqsrc`
-requires `caps` and adds `latency` (ms reported to the pipeline, default 200).
+`codec` (override the derived catalog codec string), `bitrate`, `sync`,
+`sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout`,
+`latency` (ms reported through the LATENCY query so synced sinks absorb
+network jitter instead of dropping late frames; default 200) and `caps`,
+which is optional for CMAF and H.264 LOC — it is derived from the catalog
+when omitted. Automatic H.264 LOC caps describe Annex B access units;
+length-prefixed payloads and catalog-only decoder configuration are not yet
+handled automatically. Other LOC codecs require explicit compatible caps.
 
-`moqsrc` subscribes only to `track-name` and reports an error if it is not
-announced within `discovery-timeout` (ms, default 10000). When that track ends,
-the source delivers its remaining queued buffers, then sends EOS while the
-relay connection remains open.
+`moqsink` is a plain `GstElement`, not a `GstBaseSink`: it does not preroll,
+so `READY` to `PAUSED` returns immediately instead of waiting for the first
+buffer, and `PAUSED` does not pause publishing — buffers already queued keep
+going out to the relay until the pipeline reaches `NULL` or the source stops
+delivering them. Only `sync` is exposed; the other `GstBaseSink` properties
+(`async`, `qos`, `max-lateness`, `ts-offset`, `blocksize`,
+`enable-last-sample`, `render-delay`) do not exist on this element.
 
 `moqsrc` maps LOC presentation times onto the pipeline clock: the first object
 is anchored at the running time of its arrival and later objects keep their
@@ -83,12 +92,46 @@ bridge draft-16 and draft-18 sessions have been seen to forward the LOC
 property block verbatim, and the two drafts encode its integers differently
 (QUIC varint vs vi64), so a cross-draft subscriber rejects the objects.
 
+### CMAF (fragmented MP4) with audio
+
+`moqsink` also takes fragmented MP4 on request pads `video_%u` and `audio_%u`
+and publishes each as a CMAF track under one CMSF-01 catalog (`packaging:
+"cmaf"`, root `initDataList`, per-track `initRef`). Feed each pad from its own
+fragmented muxer; one moof+mdat fragment becomes one MoQ object, and a
+fragment starting on a sync sample opens a new group, so keep
+`fragment-duration` a multiple of the GOP length.
+
+```sh
+gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace=example \
+  videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse \
+    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.video_0 \
+  audiotestsrc is-live=true ! voaacenc ! aacparse \
+    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.audio_0
+```
+
+Opus works the same way (`opusenc ! opusparse ! mp4mux ...`). Pad properties
+`track-name` and `bitrate` set the catalog entry per pad (`ms.video_0::track-name=hd`).
+Element property `sap-timeline` adds a CMSF SAP event timeline track per CMAF track.
+
+Play a CMAF track back with `qtdemux`; `caps` is derived from the catalog:
+
+```sh
+gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=video \
+  ! qtdemux ! h264parse ! avdec_h264 ! autovideosink
+gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=audio \
+  ! qtdemux ! aacparse ! avdec_aac ! autoaudiosink
+```
+
 ## Status
 
-H.264 byte-stream over WebTransport, validated end to end through a MoQ relay
-with both `moqsrc` and the Red5 Playa browser player (draft-16 and draft-18).
-Opus audio, a self-describing catalog (so `moqsrc` needs no `caps`), and a
-raw-QUIC (`moqt://`) transport option are follow-ups.
+The plugin supports H.264 Annex B LOC publishing and CMAF video/audio under a
+CMSF-01 catalog. CMAF codec strings cover AVC, AAC and Opus; automatic LOC
+receiver caps cover H.264 only. Finite draft-16 LOC plus CMAF/AAC delivery,
+independent track EOS and publisher drain passed through the Chicago and London
+moqx relays with the exact private SDK described below. Separately captured
+CMAF AVC/AAC from Playa decoded offline. These results do not qualify arbitrary
+LOC framing, Opus playback, draft-18 finite EOS or every relay implementation.
+A raw-QUIC (`moqt://`) transport option is a follow-up.
 
 ## Author
 
@@ -98,17 +141,26 @@ Raymond Lucke and the Red5 Team
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-Publisher EOS retries track-end acceptance and flushes the local service and
-reliable-stream queues within one three-second budget. A successful flush is
-not proof of peer receipt or decode. Timeout, interruption, producer failure,
-closed connection or unsupported drain posts an error instead of successful
-EOS. Returning to READY/NULL remains an abrupt cancellation boundary.
+Publisher EOS uses one three-second acceptance/drain budget and requires MOQ5's
+service-aware endpoint drain. Failure or cancellation posts an error rather than
+successful EOS; local flush does not prove peer receipt or decode. Released pads
+retain their native end obligations until sender teardown. FLUSH_STOP does not
+reopen an ended track. Returning through READY creates a fresh sender lifetime.
 
-These EOS changes require MOQ5's service-aware endpoint drain; older SDKs with
-transport-only drain cannot establish this guarantee. The tested SDK is a private
-service-drain delivery based on f9e20ebf with additional native changes, not a
-released MOQ5 package. Consumers must supply a MOQ5 SDK with these service-drain
-guarantees; a public minimum revision has not yet been established. Finite
-draft-16 network delivery and EOS were qualified for that exact SDK with the
-picoquic WebTransport backend. Relay catalog bootstrap support is a separate
-requirement for playback against a given relay.
+The local fixture in `tests/local_fixture.py` generates independent LOC access
+units and CMAF init/fragments, pins their SHA256 inventory, and validates output
+through an offline appsrc/appsink replay. Its `plan` command constructs one
+publisher and both receivers at NULL without connecting. `publish`/`receive`
+require explicit traffic authorization and accept `--draft 16` or `--draft 18`,
+with draft16 as the default,
+TLS verification and a fresh per-run readiness directory. Priming media is part
+of the inventory; the counted suffix waits for real receiver priming receipts.
+Public TRACK_ENDED evidence distinguishes service end from local timeout/close,
+but the native event also covers rejection and is not wire-marker provenance.
+
+The EOS contract requires MOQ5's service-aware endpoint drain. The tested SDK is
+a private delivery based on f9e20ebf with additional native changes, not a
+released MOQ5 package; older transport-only drain implementations are insufficient.
+Consumers must supply a MOQ5 SDK with these service-drain guarantees; a public
+minimum revision has not yet been established. Relay catalog bootstrap support
+is a separate requirement for playback against a given relay.

@@ -50,7 +50,10 @@ find_package(libmoq REQUIRED COMPONENTS service)
 add_library(gstmoq MODULE
     src/gstmoqplugin.c
     src/gstmoqsink.c
-    src/gstmoqsrc.c)
+    src/gstmoqsinkpad.c
+    src/gstmoqsrc.c
+    src/gstmoqfmp4.c
+    src/gstmoqcodec.c)
 
 target_link_libraries(gstmoq PRIVATE
     PkgConfig::GST
@@ -84,21 +87,47 @@ set_target_properties(gstmoq PROPERTIES
     OUTPUT_NAME "gstmoq"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins")
 
+# Unit tests: plain GLib executables, no GStreamer pipeline, no network.
 include(CTest)
 if(BUILD_TESTING)
+    pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
+    add_executable(inspect_cmaf_fixture tests/inspect_cmaf_fixture.c
+        src/gstmoqfmp4.c src/gstmoqcodec.c)
+    target_include_directories(inspect_cmaf_fixture PRIVATE src)
+    target_link_libraries(inspect_cmaf_fixture PRIVATE PkgConfig::GLIB moq::cmaf moq::core)
+    target_compile_options(inspect_cmaf_fixture PRIVATE -Wall -Wextra)
+    add_executable(test_sink_recovery tests/test_sink_recovery.c
+        src/gstmoqsinkpad.c src/gstmoqcodec.c src/gstmoqfmp4.c)
+    target_include_directories(test_sink_recovery PRIVATE
+        $<TARGET_PROPERTY:moq::service,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(test_sink_recovery PRIVATE PkgConfig::GST moq::cmaf moq::core)
+    target_compile_options(test_sink_recovery PRIVATE -Wall -Wextra)
+    add_test(NAME sink_recovery COMMAND test_sink_recovery)
+    set_tests_properties(sink_recovery PROPERTIES TIMEOUT 10)
     add_executable(test_src_delivery tests/test_src_delivery.c)
-    # Public MOQ5 headers only; the test supplies deterministic service mocks.
     target_include_directories(test_src_delivery PRIVATE
         $<TARGET_PROPERTY:moq::service,INTERFACE_INCLUDE_DIRECTORIES>)
     target_link_libraries(test_src_delivery PRIVATE PkgConfig::GST)
     target_compile_options(test_src_delivery PRIVATE -Wall -Wextra)
     add_test(NAME src_delivery COMMAND test_src_delivery)
     set_tests_properties(src_delivery PROPERTIES TIMEOUT 10)
-    add_executable(test_sink_ownership tests/test_sink_ownership.c)
-    target_include_directories(test_sink_ownership PRIVATE
-        $<TARGET_PROPERTY:moq::service,INTERFACE_INCLUDE_DIRECTORIES>)
-    target_link_libraries(test_sink_ownership PRIVATE PkgConfig::GST moq::core)
-    target_compile_options(test_sink_ownership PRIVATE -Wall -Wextra)
-    add_test(NAME sink_ownership COMMAND test_sink_ownership)
-    set_tests_properties(sink_ownership PROPERTIES TIMEOUT 10)
+
+    add_executable(test_fmp4_splitter
+        tests/test_fmp4_splitter.c
+        src/gstmoqfmp4.c)
+    target_include_directories(test_fmp4_splitter PRIVATE src)
+    target_link_libraries(test_fmp4_splitter PRIVATE PkgConfig::GLIB)
+    target_compile_options(test_fmp4_splitter PRIVATE -Wall -Wextra)
+    add_test(NAME fmp4_splitter COMMAND test_fmp4_splitter)
+
+    add_executable(test_codec_string
+        tests/test_codec_string.c
+        src/gstmoqcodec.c)
+    target_include_directories(test_codec_string PRIVATE src)
+    target_link_libraries(test_codec_string PRIVATE PkgConfig::GLIB moq::cmaf moq::core)
+    target_compile_options(test_codec_string PRIVATE -Wall -Wextra)
+    add_test(NAME codec_string COMMAND test_codec_string)
+
+    add_test(NAME smoke
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh ${CMAKE_BINARY_DIR}/plugins)
 endif()
