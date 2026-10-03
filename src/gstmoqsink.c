@@ -5,10 +5,13 @@
  * The service tier owns the network thread, version negotiation, the
  * sticky MSF catalog, and the bounded send queue. This element is a thin
  * adapter over it: start() opens a WebTransport endpoint to a MoQ relay
- * and attaches a media sender with one video track; render() wraps each
- * GstBuffer zero-copy and submits it as a media object carrying typed
- * timing/keyframe fields — the service derives and publishes the catalog
- * and generates the LOC-01 property block. No transport pump, no manual
+ * and attaches a media sender; the video track is added on the first
+ * keyframe, once its SPS/PPS are known, so the catalog entry carries an
+ * avcC initData (WebCodecs players need the decoder description) plus a
+ * codec string, width, height and framerate that match the stream.
+ * render() wraps each GstBuffer zero-copy and submits it as a media object
+ * carrying typed timing/keyframe fields — the service derives and publishes
+ * the catalog and generates the LOC-01 property block. No transport pump, no manual
  * publisher, no group/object bookkeeping in this element.
  *
  * Ownership: moq_media_sender_write() takes the payload rcbuf on MOQ_OK;
@@ -27,6 +30,7 @@
  * returns immediately; unlock_stop() clears it.
  */
 #include "gstmoqsink.h"
+#include "gstmoqeos.h"
 
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
@@ -42,12 +46,8 @@ GST_DEBUG_CATEGORY_STATIC (gst_moq_sink_debug);
 #define DEFAULT_RELAY_PATH "/moq-relay"
 #define DEFAULT_NAMESPACE  "example"
 #define DEFAULT_TRACK_NAME "video"
-#define DEFAULT_CODEC      "avc1.42e01e"
+#define DEFAULT_DRAFT      16            /* browsers (playa) default to draft-16; 0 = offer all */
 #define DEFAULT_BITRATE    2000000       /* catalog max bitrate (MSF-01 §5.2.22) */
-
-/* On EOS, bound how long the streaming thread waits for the send queue
- * (final GOP + END_OF_TRACK) to drain before teardown. */
-#define EOS_DRAIN_TIMEOUT_US (3 * G_USEC_PER_SEC)
 
 enum
 {
@@ -60,6 +60,7 @@ enum
   PROP_TRACK_NAME,
   PROP_CODEC,
   PROP_BITRATE,
+  PROP_DRAFT,
 };
 
 /* A mapped access unit, kept alive by the in-flight payload rcbuf. */
@@ -80,14 +81,20 @@ struct _GstMoqSink
   gboolean insecure;
   gchar   *namespace_str;
   gchar   *track_name;
-  gchar   *codec;
+  gchar   *codec;          /* NULL = derive from the SPS */
   guint64  bitrate;
+  guint    draft;          /* MoQT draft to negotiate, 0 = auto */
+
+  /* from caps */
+  gint width, height;
+  gint fps_n, fps_d;
 
   /* runtime, created in start() */
   moq_endpoint_t     *ep;
   moq_media_sender_t *sender;
   moq_media_track_t  *track;
   gboolean            started;
+  gboolean            interrupted; /* BaseSink unlock owner, under OBJECT_LOCK */
 
   /* namespace split into borrowed parts (stable for element lifetime) */
   gchar      **ns_tokens;
@@ -166,6 +173,153 @@ gst_moq_sink_build_namespace (GstMoqSink *self)
   return TRUE;
 }
 
+/* -- H.264 parameter sets ------------------------------------------------ */
+
+/* Locate the first SPS and PPS NAL units in an Annex B access unit. The
+ * returned spans exclude start codes and any trailing zero bytes that
+ * belong to the next 4-byte start code. */
+static gboolean
+find_sps_pps (const guint8 *data, gsize len, const guint8 **sps, gsize *sps_len,
+    const guint8 **pps, gsize *pps_len)
+{
+  *sps = *pps = NULL;
+  *sps_len = *pps_len = 0;
+
+  gsize i = 0;
+  gsize nal_start = 0;
+  gboolean in_nal = FALSE;
+
+  while (i + 3 <= len) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+      if (in_nal) {
+        gsize end = i;
+        while (end > nal_start && data[end - 1] == 0)
+          end--;
+        guint8 type = data[nal_start] & 0x1f;
+        if (type == 7 && !*sps) {
+          *sps = data + nal_start;
+          *sps_len = end - nal_start;
+        } else if (type == 8 && !*pps) {
+          *pps = data + nal_start;
+          *pps_len = end - nal_start;
+        }
+      }
+      i += 3;
+      nal_start = i;
+      in_nal = TRUE;
+      continue;
+    }
+    i++;
+  }
+  if (in_nal && nal_start < len) {
+    guint8 type = data[nal_start] & 0x1f;
+    if (type == 7 && !*sps) {
+      *sps = data + nal_start;
+      *sps_len = len - nal_start;
+    } else if (type == 8 && !*pps) {
+      *pps = data + nal_start;
+      *pps_len = len - nal_start;
+    }
+  }
+  return *sps && *sps_len >= 4 && *pps && *pps_len >= 1;
+}
+
+/* Build an ISO 14496-15 AVCDecoderConfigurationRecord (4-byte NAL lengths)
+ * from one SPS and one PPS. */
+static GBytes *
+build_avcc (const guint8 *sps, gsize sps_len, const guint8 *pps, gsize pps_len)
+{
+  GByteArray *a = g_byte_array_sized_new (11 + sps_len + pps_len);
+  guint8 hdr[6] = { 1, sps[1], sps[2], sps[3], 0xfc | 3, 0xe0 | 1 };
+  guint8 be16[2];
+
+  g_byte_array_append (a, hdr, sizeof hdr);
+  be16[0] = sps_len >> 8; be16[1] = sps_len & 0xff;
+  g_byte_array_append (a, be16, 2);
+  g_byte_array_append (a, sps, sps_len);
+  hdr[0] = 1;
+  g_byte_array_append (a, hdr, 1);
+  be16[0] = pps_len >> 8; be16[1] = pps_len & 0xff;
+  g_byte_array_append (a, be16, 2);
+  g_byte_array_append (a, pps, pps_len);
+  return g_byte_array_free_to_bytes (a);
+}
+
+/* Register the video track with the sender. Called once, on the first
+ * keyframe, so the catalog entry can carry the stream's real SPS/PPS as
+ * initData and a codec string matching its profile/level. */
+static gboolean
+gst_moq_sink_add_track (GstMoqSink *self, const guint8 *au, gsize au_len)
+{
+  const guint8 *sps, *pps;
+  gsize sps_len, pps_len;
+  GBytes *avcc = NULL;
+  gchar *codec = NULL;
+
+  if (find_sps_pps (au, au_len, &sps, &sps_len, &pps, &pps_len)) {
+    avcc = build_avcc (sps, sps_len, pps, pps_len);
+    if (!self->codec)
+      codec = g_strdup_printf ("avc1.%02x%02x%02x", sps[1], sps[2], sps[3]);
+  } else {
+    GST_WARNING_OBJECT (self, "keyframe carries no SPS/PPS; publishing "
+        "without initData (use h264parse config-interval=-1)");
+  }
+  if (!codec)
+    codec = g_strdup (self->codec ? self->codec : "avc1.42e01e");
+
+  moq_media_track_cfg_t tc;
+  moq_media_track_cfg_init (&tc);
+  tc.name.data = (const uint8_t *) self->track_name;
+  tc.name.len = strlen (self->track_name);
+  tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+  tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+  tc.codec.data = (const uint8_t *) codec;
+  tc.codec.len = strlen (codec);
+  tc.is_live = TRUE;
+  tc.bitrate = self->bitrate;   /* MSF-01 §5.2.22: required for media tracks */
+  if (avcc) {
+    gsize n;
+    tc.init_data.data = g_bytes_get_data (avcc, &n);
+    tc.init_data.len = n;
+  }
+  if (self->width > 0 && self->height > 0) {
+    tc.width = self->width;
+    tc.height = self->height;
+  }
+  if (self->fps_n > 0 && self->fps_d > 0)
+    tc.framerate_millis = gst_util_uint64_scale_int (1000, self->fps_n,
+        self->fps_d);
+
+  moq_result_t rc = moq_media_sender_add_track (self->sender, &tc, &self->track);
+  if (rc != MOQ_OK) {
+    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
+        ("could not add track \"%s\" (rc=%d)", self->track_name, (int) rc),
+        (NULL));
+  } else {
+    GST_INFO_OBJECT (self, "added track %s codec=%s %dx%d initData=%zu B",
+        self->track_name, codec, self->width, self->height,
+        (gsize) tc.init_data.len);
+  }
+  g_free (codec);
+  g_clear_pointer (&avcc, g_bytes_unref);
+  return rc == MOQ_OK;
+}
+
+static gboolean
+gst_moq_sink_set_caps (GstBaseSink *bsink, GstCaps *caps)
+{
+  GstMoqSink *self = GST_MOQ_SINK (bsink);
+  GstStructure *st = gst_caps_get_structure (caps, 0);
+
+  self->width = self->height = 0;
+  self->fps_n = self->fps_d = 0;
+  gst_structure_get_int (st, "width", &self->width);
+  gst_structure_get_int (st, "height", &self->height);
+  gst_structure_get_fraction (st, "framerate", &self->fps_n, &self->fps_d);
+  GST_DEBUG_OBJECT (self, "caps %" GST_PTR_FORMAT, caps);
+  return TRUE;
+}
+
 /* -- GstBaseSink vmethods ------------------------------------------------ */
 
 static gboolean
@@ -176,7 +330,10 @@ gst_moq_sink_start (GstBaseSink *bsink)
   if (!gst_moq_sink_build_namespace (self))
     return FALSE;
 
+  GST_OBJECT_LOCK (self);
   self->ep = NULL;
+  self->interrupted = FALSE;
+  GST_OBJECT_UNLOCK (self);
   self->sender = NULL;
   self->track = NULL;
   self->objects_sent = 0;
@@ -191,8 +348,16 @@ gst_moq_sink_start (GstBaseSink *bsink)
   ec.url.len = strlen (url);
   ec.protocol = MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT;
   ec.insecure_skip_verify = self->insecure;
+  moq_version_t pinned = (moq_version_t) self->draft;
+  if (self->draft != 0) {
+    ec.versions.struct_size = sizeof ec.versions;
+    ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+    ec.versions.versions = &pinned;
+    ec.versions.version_count = 1;
+  }
 
-  moq_result_t rc = moq_endpoint_connect (&ec, &self->ep);
+  moq_endpoint_t *ep = NULL;
+  moq_result_t rc = moq_endpoint_connect (&ec, &ep);
   g_free (url);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
@@ -207,31 +372,19 @@ gst_moq_sink_start (GstBaseSink *bsink)
   sc.namespace_.parts = self->ns_bytes;
   sc.namespace_.count = self->ns_count;
 
-  rc = moq_media_sender_attach (self->ep, &sc, &self->sender);
+  rc = moq_media_sender_attach (ep, &sc, &self->sender);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not attach media sender (rc=%d)", (int) rc), (NULL));
     goto fail_ep;
   }
 
-  moq_media_track_cfg_t tc;
-  moq_media_track_cfg_init (&tc);
-  tc.name.data = (const uint8_t *) self->track_name;
-  tc.name.len = strlen (self->track_name);
-  tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
-  tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
-  tc.codec.data = (const uint8_t *) self->codec;
-  tc.codec.len = strlen (self->codec);
-  tc.is_live = TRUE;
-  tc.bitrate = self->bitrate;   /* MSF-01 §5.2.22: required for media tracks */
+  GST_OBJECT_LOCK (self);
+  self->ep = ep;
+  moq_endpoint_set_interrupted (ep, self->interrupted);
+  GST_OBJECT_UNLOCK (self);
 
-  rc = moq_media_sender_add_track (self->sender, &tc, &self->track);
-  if (rc != MOQ_OK) {
-    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
-        ("could not add track \"%s\" (rc=%d)", self->track_name, (int) rc),
-        (NULL));
-    goto fail_sender;
-  }
+  /* The track is added on the first keyframe (see gst_moq_sink_add_track). */
 
   self->started = TRUE;
   GST_INFO_OBJECT (self, "started: publishing ns=%s name=%s via relay %s:%u%s",
@@ -239,14 +392,9 @@ gst_moq_sink_start (GstBaseSink *bsink)
       self->relay_path);
   return TRUE;
 
-fail_sender:
-  moq_media_sender_destroy (self->sender);
-  self->sender = NULL;
-  self->track = NULL;
 fail_ep:
-  moq_endpoint_stop (self->ep);
-  moq_endpoint_destroy (self->ep);
-  self->ep = NULL;
+  moq_endpoint_stop (ep);
+  moq_endpoint_destroy (ep);
 fail_ns:
   g_clear_pointer (&self->ns_tokens, g_strfreev);
   g_clear_pointer (&self->ns_bytes, g_free);
@@ -263,8 +411,12 @@ gst_moq_sink_stop (GstBaseSink *bsink)
     return TRUE;
 
   /* Wake any blocked write(), then tear down child-before-endpoint. */
-  if (self->ep)
-    moq_endpoint_set_interrupted (self->ep, TRUE);
+  GST_OBJECT_LOCK (self);
+  moq_endpoint_t *ep = self->ep;
+  self->ep = NULL;
+  if (ep)
+    moq_endpoint_set_interrupted (ep, TRUE);
+  GST_OBJECT_UNLOCK (self);
 
   if (self->sender) {
     moq_media_sender_stats_t st;
@@ -277,10 +429,9 @@ gst_moq_sink_stop (GstBaseSink *bsink)
     self->sender = NULL;
     self->track = NULL;
   }
-  if (self->ep) {
-    moq_endpoint_stop (self->ep);
-    moq_endpoint_destroy (self->ep);
-    self->ep = NULL;
+  if (ep) {
+    moq_endpoint_stop (ep);
+    moq_endpoint_destroy (ep);
   }
 
   g_clear_pointer (&self->ns_tokens, g_strfreev);
@@ -297,8 +448,11 @@ static gboolean
 gst_moq_sink_unlock (GstBaseSink *bsink)
 {
   GstMoqSink *self = GST_MOQ_SINK (bsink);
+  GST_OBJECT_LOCK (self);
+  self->interrupted = TRUE;
   if (self->ep)
     moq_endpoint_set_interrupted (self->ep, TRUE);
+  GST_OBJECT_UNLOCK (self);
   return TRUE;
 }
 
@@ -306,8 +460,11 @@ static gboolean
 gst_moq_sink_unlock_stop (GstBaseSink *bsink)
 {
   GstMoqSink *self = GST_MOQ_SINK (bsink);
+  GST_OBJECT_LOCK (self);
+  self->interrupted = FALSE;
   if (self->ep)
     moq_endpoint_set_interrupted (self->ep, FALSE);
+  GST_OBJECT_UNLOCK (self);
   return TRUE;
 }
 
@@ -334,6 +491,17 @@ gst_moq_sink_render (GstBaseSink *bsink, GstBuffer *buffer)
 
   gboolean keyframe =
       !GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+  if (!self->track) {
+    if (!keyframe) {
+      GST_LOG_OBJECT (self, "dropping delta frame before the first keyframe");
+      sink_frame_free (f);
+      return GST_FLOW_OK;
+    }
+    if (!gst_moq_sink_add_track (self, f->map.data, f->map.size)) {
+      sink_frame_free (f);
+      return GST_FLOW_ERROR;
+    }
+  }
   /* Rebase to the first PTS so LOC carries small, stream-relative times.
    * A huge wall-clock-ish base misleads the receiver and is rejected by
    * some relays' object-extension parsers. */
@@ -371,12 +539,14 @@ gst_moq_sink_render (GstBaseSink *bsink, GstBuffer *buffer)
   o.presentation_time_us = pts_us;
   o.has_capture_time = FALSE;
 
+  /* The service may release f as soon as ownership transfers. */
+  gsize payload_size = f->map.size;
   moq_result_t rc = moq_media_sender_write (self->sender, self->track, &o);
   switch (rc) {
     case MOQ_OK:
       self->objects_sent++;
       GST_LOG_OBJECT (self, "wrote %s pts=%" G_GUINT64_FORMAT "us (%zu B)",
-          keyframe ? "keyframe" : "delta", pts_us, f->map.size);
+          keyframe ? "keyframe" : "delta", pts_us, payload_size);
       return GST_FLOW_OK;
     case MOQ_ERR_WOULD_BLOCK:
       /* Live policy: a GOP the queue can't hold, or a delta before the
@@ -390,8 +560,9 @@ gst_moq_sink_render (GstBaseSink *bsink, GstBuffer *buffer)
       return GST_FLOW_FLUSHING;
     case MOQ_ERR_CLOSED:
       moq_rcbuf_decref (payload);
-      GST_INFO_OBJECT (self, "endpoint closed; ending stream");
-      return GST_FLOW_EOS;
+      GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+          ("endpoint closed before publisher EOS"), (NULL));
+      return GST_FLOW_ERROR;
     default:
       moq_rcbuf_decref (payload);
       GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
@@ -400,45 +571,36 @@ gst_moq_sink_render (GstBaseSink *bsink, GstBuffer *buffer)
   }
 }
 
-/* Signal a clean end-of-track on EOS so subscribers see TRACK_ENDED rather
- * than a dropped connection, then drain the send queue (bounded) so the
- * final GOP and the END_OF_TRACK reach the wire before stop() tears the
- * endpoint down. */
+/* BaseSink serializes EOS behind render calls. We post no endpoint tasks;
+ * all work-creating sender calls have returned before this barrier. */
+static gboolean
+gst_moq_sink_finish_eos (GstMoqSink *self)
+{
+  gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
+  moq_result_t rc = self->sender && self->ep ? MOQ_OK : MOQ_ERR_CLOSED;
+  if (rc == MOQ_OK && self->track)
+    rc = gst_moq_eos_end (self->ep, self->sender, self->track, deadline);
+  if (rc == MOQ_OK)
+    rc = gst_moq_eos_drain (self->ep, deadline);
+  if (rc != MOQ_OK) {
+    GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+        ("publisher EOS failed or aborted (rc=%d)", (int) rc),
+        ("Local service/stream flush did not complete; teardown may discard the tail"));
+    return FALSE;
+  }
+  GST_INFO_OBJECT (self, "publisher EOS: local service and stream queues flushed");
+  return TRUE;
+}
+
 static gboolean
 gst_moq_sink_event (GstBaseSink *bsink, GstEvent *event)
 {
   GstMoqSink *self = GST_MOQ_SINK (bsink);
-
-  if (GST_EVENT_TYPE (event) == GST_EVENT_EOS && self->sender && self->track) {
-    moq_result_t rc = moq_media_sender_end_track (self->sender, self->track);
-    if (rc == MOQ_OK) {
-      gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
-      for (;;) {
-        moq_media_sender_stats_t st;
-        if (moq_media_sender_get_stats (self->sender, &st, sizeof st) != MOQ_OK)
-          break;
-        if (st.objects_queued == 0) {
-          GST_INFO_OBJECT (self, "ended track on EOS (send queue drained)");
-          break;
-        }
-        if (moq_media_sender_is_fatal (self->sender))
-          break;
-        if (g_get_monotonic_time () >= deadline) {
-          GST_WARNING_OBJECT (self, "EOS drain timed out, %" G_GUINT64_FORMAT
-              " objects still queued", st.objects_queued);
-          break;
-        }
-        g_usleep (5000);
-      }
-      /* Flush the transport send queues so the final GOP and the END_OF_TRACK
-       * actually leave the wire before stop() tears the endpoint down. */
-      if (self->ep)
-        moq_endpoint_drain (self->ep, EOS_DRAIN_TIMEOUT_US);
-    } else if (rc != MOQ_ERR_WRONG_STATE) {  /* WRONG_STATE = already ended */
-      GST_WARNING_OBJECT (self, "end_track failed (rc=%d)", (int) rc);
-    }
+  if (GST_EVENT_TYPE (event) == GST_EVENT_EOS &&
+      !gst_moq_sink_finish_eos (self)) {
+    gst_event_unref (event);
+    return FALSE;
   }
-
   return GST_BASE_SINK_CLASS (gst_moq_sink_parent_class)->event (bsink, event);
 }
 
@@ -479,6 +641,9 @@ gst_moq_sink_set_property (GObject *object, guint prop_id,
     case PROP_BITRATE:
       self->bitrate = g_value_get_uint64 (value);
       break;
+    case PROP_DRAFT:
+      self->draft = g_value_get_uint (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -513,6 +678,9 @@ gst_moq_sink_get_property (GObject *object, guint prop_id,
       break;
     case PROP_BITRATE:
       g_value_set_uint64 (value, self->bitrate);
+      break;
+    case PROP_DRAFT:
+      g_value_set_uint (value, self->draft);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -567,7 +735,13 @@ gst_moq_sink_class_init (GstMoqSinkClass *klass)
           DEFAULT_TRACK_NAME, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_CODEC,
       g_param_spec_string ("codec", "Codec",
-          "Catalog codec string for the published track", DEFAULT_CODEC,
+          "Catalog codec string for the published track "
+          "(default: derived from the stream's SPS, e.g. avc1.42c01e)", NULL,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_DRAFT,
+      g_param_spec_uint ("draft", "MoQT draft",
+          "MoQ Transport draft version to negotiate (16 or 18); "
+          "0 offers every draft libmoq supports", 0, 18, DEFAULT_DRAFT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_BITRATE,
       g_param_spec_uint64 ("bitrate", "Bitrate",
@@ -582,6 +756,7 @@ gst_moq_sink_class_init (GstMoqSinkClass *klass)
 
   basesink_class->start = GST_DEBUG_FUNCPTR (gst_moq_sink_start);
   basesink_class->stop = GST_DEBUG_FUNCPTR (gst_moq_sink_stop);
+  basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_moq_sink_set_caps);
   basesink_class->render = GST_DEBUG_FUNCPTR (gst_moq_sink_render);
   basesink_class->unlock = GST_DEBUG_FUNCPTR (gst_moq_sink_unlock);
   basesink_class->unlock_stop = GST_DEBUG_FUNCPTR (gst_moq_sink_unlock_stop);
@@ -596,6 +771,7 @@ gst_moq_sink_init (GstMoqSink *self)
   self->relay_path = g_strdup (DEFAULT_RELAY_PATH);
   self->namespace_str = g_strdup (DEFAULT_NAMESPACE);
   self->track_name = g_strdup (DEFAULT_TRACK_NAME);
-  self->codec = g_strdup (DEFAULT_CODEC);
+  self->codec = NULL;
   self->bitrate = DEFAULT_BITRATE;
+  self->draft = DEFAULT_DRAFT;
 }

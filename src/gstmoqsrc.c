@@ -21,6 +21,14 @@
  * Topology: the service endpoint is a CLIENT. moqsrc and moqsink both dial
  * a relay (e.g. moqx over WebTransport) rather than each other.
  *
+ * Timestamps: LOC presentation times are publisher-relative (moqsink rebases
+ * them to its first frame, other publishers may use wall-clock epochs), so
+ * they are meaningless on this pipeline's clock. The first delivered object
+ * is pinned to the pipeline's running time at arrival and every later PTS
+ * keeps its offset from that anchor, which preserves the publisher's frame
+ * cadence. The "latency" property is reported through the LATENCY query so
+ * synced sinks absorb network jitter instead of dropping late frames.
+ *
  * Interrupt: unlock() latches the endpoint interrupt so a blocked poll/wait
  * returns immediately; unlock_stop() clears it.
  */
@@ -40,6 +48,9 @@ GST_DEBUG_CATEGORY_STATIC (gst_moq_src_debug);
 #define DEFAULT_NAMESPACE  "example"
 #define DEFAULT_TRACK_NAME "video"
 #define WAIT_TIMEOUT_US    (100 * 1000)
+#define DEFAULT_LATENCY_MS 200
+#define DEFAULT_DISCOVERY_TIMEOUT_MS 10000
+#define DEFAULT_DRAFT      16            /* browsers (playa) default to draft-16; 0 = offer all */
 
 enum
 {
@@ -51,6 +62,9 @@ enum
   PROP_NAMESPACE,
   PROP_TRACK_NAME,
   PROP_CAPS,
+  PROP_LATENCY,
+  PROP_DRAFT,
+  PROP_DISCOVERY_TIMEOUT,
 };
 
 struct _GstMoqSrc
@@ -65,11 +79,17 @@ struct _GstMoqSrc
   gchar   *namespace_str;
   gchar   *track_name;
   GstCaps *caps;
+  guint    latency_ms;
+  guint    draft;          /* MoQT draft to negotiate, 0 = auto */
+  guint    discovery_timeout_ms;
 
   /* runtime */
   moq_endpoint_t       *ep;
   moq_media_receiver_t *receiver;
   moq_media_track_t    *want_track;   /* handle matching track-name, or NULL */
+  gboolean              want_track_ended;
+  gboolean              selection_failed;
+  gint64                discover_deadline;
   gboolean              started;
   gboolean              caps_pushed;
   gboolean              catalog_ready;
@@ -80,6 +100,11 @@ struct _GstMoqSrc
   guint        ns_count;
 
   guint64 objects_recv;
+
+  /* timestamp anchor: first object's LOC time -> pipeline running time */
+  gboolean     have_anchor;
+  guint64      anchor_loc_us;
+  GstClockTime anchor_running;
 };
 
 G_DEFINE_TYPE (GstMoqSrc, gst_moq_src, GST_TYPE_PUSH_SRC)
@@ -145,9 +170,14 @@ gst_moq_src_start (GstBaseSrc *bsrc)
   self->ep = NULL;
   self->receiver = NULL;
   self->want_track = NULL;
+  self->want_track_ended = FALSE;
+  self->selection_failed = FALSE;
+  self->discover_deadline = g_get_monotonic_time () +
+      (gint64) self->discovery_timeout_ms * 1000;
   self->caps_pushed = FALSE;
   self->catalog_ready = FALSE;
   self->objects_recv = 0;
+  self->have_anchor = FALSE;
 
   gchar *url = g_strdup_printf ("https://%s:%u%s", self->host, self->port,
       self->relay_path);
@@ -158,6 +188,13 @@ gst_moq_src_start (GstBaseSrc *bsrc)
   ec.url.len = strlen (url);
   ec.protocol = MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT;
   ec.insecure_skip_verify = self->insecure;
+  moq_version_t pinned = (moq_version_t) self->draft;
+  if (self->draft != 0) {
+    ec.versions.struct_size = sizeof ec.versions;
+    ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+    ec.versions.versions = &pinned;
+    ec.versions.version_count = 1;
+  }
 
   moq_result_t rc = moq_endpoint_connect (&ec, &self->ep);
   g_free (url);
@@ -173,7 +210,7 @@ gst_moq_src_start (GstBaseSrc *bsrc)
   rcfg.endpoint = NULL;         /* attach: we own the endpoint above */
   rcfg.namespace_.parts = self->ns_bytes;
   rcfg.namespace_.count = self->ns_count;
-  rcfg.auto_subscribe = TRUE;
+  rcfg.auto_subscribe = FALSE; /* Subscribe only to the requested track. */
 
   rc = moq_media_receiver_attach (self->ep, &rcfg, &self->receiver);
   if (rc != MOQ_OK) {
@@ -249,6 +286,47 @@ gst_moq_src_unlock_stop (GstBaseSrc *bsrc)
   return TRUE;
 }
 
+static gboolean
+gst_moq_src_query (GstBaseSrc *bsrc, GstQuery *query)
+{
+  GstMoqSrc *self = GST_MOQ_SRC (bsrc);
+
+  if (GST_QUERY_TYPE (query) == GST_QUERY_LATENCY) {
+    GstClockTime lat = self->latency_ms * GST_MSECOND;
+    gst_query_set_latency (query, TRUE, lat, GST_CLOCK_TIME_NONE);
+    return TRUE;
+  }
+  return GST_BASE_SRC_CLASS (gst_moq_src_parent_class)->query (bsrc, query);
+}
+
+/* Map a LOC presentation time onto this pipeline's running time. */
+static GstClockTime
+gst_moq_src_map_pts (GstMoqSrc *self, guint64 loc_us)
+{
+  if (!self->have_anchor) {
+    GstClock *clock = gst_element_get_clock (GST_ELEMENT (self));
+    GstClockTime now = GST_CLOCK_TIME_NONE;
+    if (clock) {
+      GstClockTime base = gst_element_get_base_time (GST_ELEMENT (self));
+      GstClockTime abs = gst_clock_get_time (clock);
+      if (GST_CLOCK_TIME_IS_VALID (base) && abs >= base)
+        now = abs - base;
+      gst_object_unref (clock);
+    }
+    self->anchor_running = GST_CLOCK_TIME_IS_VALID (now) ? now : 0;
+    self->anchor_loc_us = loc_us;
+    self->have_anchor = TRUE;
+    GST_INFO_OBJECT (self, "anchored LOC time %" G_GUINT64_FORMAT
+        "us at running time %" GST_TIME_FORMAT, loc_us,
+        GST_TIME_ARGS (self->anchor_running));
+  }
+  if (loc_us >= self->anchor_loc_us)
+    return self->anchor_running + (loc_us - self->anchor_loc_us) * GST_USECOND;
+  /* Earlier than the anchor (reordered / late object): clamp. */
+  GstClockTime back = (self->anchor_loc_us - loc_us) * GST_USECOND;
+  return back < self->anchor_running ? self->anchor_running - back : 0;
+}
+
 /* Drain pending track-discovery events. Logs catalog discovery and binds
  * want_track to the handle whose catalog name matches track-name. */
 static void
@@ -265,11 +343,27 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
             d && d->name.data ? (const char *) d->name.data : "",
             d ? (int) d->codec.len : 0,
             d && d->codec.data ? (const char *) d->codec.data : "");
-        if (d && d->name.len == strlen (self->track_name) &&
-            memcmp (d->name.data, self->track_name, d->name.len) == 0)
-          self->want_track = ev.track;
+        if (d && d->name.data && d->name.len == strlen (self->track_name) &&
+            memcmp (d->name.data, self->track_name, d->name.len) == 0) {
+          moq_result_t rc = moq_media_receiver_subscribe_track (
+              self->receiver, ev.track, NULL);
+          if (rc != MOQ_OK) {
+            GST_ELEMENT_ERROR (self, RESOURCE, READ,
+                ("could not subscribe to track \"%s\" (rc=%d)",
+                    self->track_name, (int) rc), (NULL));
+            self->selection_failed = TRUE;
+          } else {
+            self->want_track = ev.track;
+            self->want_track_ended = FALSE;
+          }
+        }
         break;
       }
+      case MOQ_MEDIA_TRACK_ENDED:
+      case MOQ_MEDIA_TRACK_REMOVED:
+        if (ev.track && ev.track == self->want_track)
+          self->want_track_ended = TRUE;
+        break;
       case MOQ_MEDIA_CATALOG_READY:
         self->catalog_ready = TRUE;
         GST_INFO_OBJECT (self, "CATALOG_READY");
@@ -293,14 +387,29 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
   for (;;) {
     /* Discovery first: every handle is known before its first object. */
     gst_moq_src_drain_track_events (self);
+    if (self->selection_failed)
+      return GST_FLOW_ERROR;
 
     moq_media_object_t obj;
     moq_result_t rc =
         moq_media_receiver_poll_object (self->receiver, &obj, sizeof (obj));
 
+    if (rc == MOQ_ERR_INTERRUPTED)
+      return GST_FLOW_FLUSHING;
+
+    if (!self->want_track && (rc == MOQ_OK || rc == MOQ_DONE) &&
+        g_get_monotonic_time () >= self->discover_deadline) {
+      if (rc == MOQ_OK)
+        moq_media_object_cleanup (&obj);
+      GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+          ("track \"%s\" was not announced within %u ms",
+              self->track_name, self->discovery_timeout_ms), (NULL));
+      return GST_FLOW_ERROR;
+    }
+
     if (rc == MOQ_OK) {
-      /* When track-name resolved to a handle, deliver only that track. */
-      if (self->want_track && obj.track != self->want_track) {
+      /* An unresolved name must never deliver an unrelated track. */
+      if (!self->want_track || obj.track != self->want_track) {
         moq_media_object_cleanup (&obj);
         continue;
       }
@@ -309,7 +418,7 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
         continue;
       }
       GstBuffer *buf = gst_buffer_new_memdup (obj.payload.data, obj.payload.len);
-      GST_BUFFER_PTS (buf) = obj.presentation_time_us * GST_USECOND;
+      GST_BUFFER_PTS (buf) = gst_moq_src_map_pts (self, obj.presentation_time_us);
       if (!obj.keyframe)
         GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
 
@@ -323,9 +432,6 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
       return GST_FLOW_OK;
     }
 
-    if (rc == MOQ_ERR_INTERRUPTED)
-      return GST_FLOW_FLUSHING;
-
     if (moq_media_receiver_is_fatal (self->receiver)) {
       GST_ELEMENT_ERROR (self, RESOURCE, READ,
           ("media receiver failed (code=%" G_GUINT64_FORMAT ")",
@@ -338,6 +444,11 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
       GST_INFO_OBJECT (self, "endpoint closed; sending EOS");
       return GST_FLOW_EOS;
     }
+
+    /* Track end does not close the shared endpoint. Drain queued media
+     * before ending this source, including media queued before the event. */
+    if (rc == MOQ_DONE && self->want_track_ended)
+      return GST_FLOW_EOS;
 
     /* rc == MOQ_DONE: nothing queued. Wait for the next wakeup. */
     moq_result_t w = moq_media_receiver_wait (self->receiver, WAIT_TIMEOUT_US);
@@ -381,6 +492,15 @@ gst_moq_src_set_property (GObject *object, guint prop_id,
     case PROP_CAPS:
       gst_caps_replace (&self->caps, (GstCaps *) gst_value_get_caps (value));
       break;
+    case PROP_LATENCY:
+      self->latency_ms = g_value_get_uint (value);
+      break;
+    case PROP_DRAFT:
+      self->draft = g_value_get_uint (value);
+      break;
+    case PROP_DISCOVERY_TIMEOUT:
+      self->discovery_timeout_ms = g_value_get_uint (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -412,6 +532,15 @@ gst_moq_src_get_property (GObject *object, guint prop_id,
       break;
     case PROP_CAPS:
       gst_value_set_caps (value, self->caps);
+      break;
+    case PROP_LATENCY:
+      g_value_set_uint (value, self->latency_ms);
+      break;
+    case PROP_DRAFT:
+      g_value_set_uint (value, self->draft);
+      break;
+    case PROP_DISCOVERY_TIMEOUT:
+      g_value_set_uint (value, self->discovery_timeout_ms);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -470,6 +599,21 @@ gst_moq_src_class_init (GstMoqSrcClass *klass)
       g_param_spec_boxed ("caps", "Caps",
           "Output caps describing the subscribed track's media",
           GST_TYPE_CAPS, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_LATENCY,
+      g_param_spec_uint ("latency", "Latency",
+          "Latency reported to the pipeline (ms) to absorb network jitter",
+          0, 10000, DEFAULT_LATENCY_MS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_DRAFT,
+      g_param_spec_uint ("draft", "MoQT draft",
+          "MoQ Transport draft version to negotiate (16 or 18); "
+          "0 offers every draft libmoq supports", 0, 18, DEFAULT_DRAFT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_DISCOVERY_TIMEOUT,
+      g_param_spec_uint ("discovery-timeout", "Discovery timeout",
+          "Maximum time to wait for the requested track after start (ms)",
+          1, G_MAXUINT, DEFAULT_DISCOVERY_TIMEOUT_MS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (element_class, &src_template);
   gst_element_class_set_static_metadata (element_class,
@@ -481,6 +625,7 @@ gst_moq_src_class_init (GstMoqSrcClass *klass)
   basesrc_class->stop = GST_DEBUG_FUNCPTR (gst_moq_src_stop);
   basesrc_class->unlock = GST_DEBUG_FUNCPTR (gst_moq_src_unlock);
   basesrc_class->unlock_stop = GST_DEBUG_FUNCPTR (gst_moq_src_unlock_stop);
+  basesrc_class->query = GST_DEBUG_FUNCPTR (gst_moq_src_query);
   pushsrc_class->create = GST_DEBUG_FUNCPTR (gst_moq_src_create);
 }
 
@@ -492,6 +637,9 @@ gst_moq_src_init (GstMoqSrc *self)
   self->relay_path = g_strdup (DEFAULT_RELAY_PATH);
   self->namespace_str = g_strdup (DEFAULT_NAMESPACE);
   self->track_name = g_strdup (DEFAULT_TRACK_NAME);
+  self->latency_ms = DEFAULT_LATENCY_MS;
+  self->draft = DEFAULT_DRAFT;
+  self->discovery_timeout_ms = DEFAULT_DISCOVERY_TIMEOUT_MS;
 
   gst_base_src_set_live (GST_BASE_SRC (self), TRUE);
   gst_base_src_set_format (GST_BASE_SRC (self), GST_FORMAT_TIME);
