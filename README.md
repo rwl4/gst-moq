@@ -30,7 +30,7 @@ On Linux the plugin is a shared object, so every static library it links
 for WebTransport) and libmoq into one prefix, then point CMake at it:
 
 ```sh
-cmake -B build -DCMAKE_PREFIX_PATH=<moq5-prefix>   # auto-found at ../../local-prefix
+cmake -B build -DCMAKE_PREFIX_PATH=<moq5-prefix>   # auto-found at ../local-prefix
 cmake --build build
 export GST_PLUGIN_PATH="$PWD/build/plugins"
 gst-inspect-1.0 moqsink
@@ -69,6 +69,11 @@ negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
 `codec` (override the derived catalog codec string) and `bitrate`; `moqsrc`
 requires `caps` and adds `latency` (ms reported to the pipeline, default 200).
 
+`moqsrc` subscribes only to `track-name` and reports an error if it is not
+announced within `discovery-timeout` (ms, default 10000). When that track ends,
+the source delivers its remaining queued buffers, then sends EOS while the
+relay connection remains open.
+
 `moqsrc` maps LOC presentation times onto the pipeline clock: the first object
 is anchored at the running time of its arrival and later objects keep their
 offset from it, so synced sinks play at the publisher's cadence.
@@ -92,3 +97,18 @@ Raymond Lucke and the Red5 Team
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+Publisher EOS retries track-end acceptance and flushes the local service and
+reliable-stream queues within one three-second budget. A successful flush is
+not proof of peer receipt or decode. Timeout, interruption, producer failure,
+closed connection or unsupported drain posts an error instead of successful
+EOS. Returning to READY/NULL remains an abrupt cancellation boundary.
+
+These EOS changes require MOQ5's service-aware endpoint drain; older SDKs with
+transport-only drain cannot establish this guarantee. The tested SDK is a private
+service-drain delivery based on f9e20ebf with additional native changes, not a
+released MOQ5 package. Consumers must supply a MOQ5 SDK with these service-drain
+guarantees; a public minimum revision has not yet been established. Finite
+draft-16 network delivery and EOS were qualified for that exact SDK with the
+picoquic WebTransport backend. Relay catalog bootstrap support is a separate
+requirement for playback against a given relay.

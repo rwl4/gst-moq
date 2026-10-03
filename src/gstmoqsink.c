@@ -30,6 +30,7 @@
  * returns immediately; unlock_stop() clears it.
  */
 #include "gstmoqsink.h"
+#include "gstmoqeos.h"
 
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
@@ -47,10 +48,6 @@ GST_DEBUG_CATEGORY_STATIC (gst_moq_sink_debug);
 #define DEFAULT_TRACK_NAME "video"
 #define DEFAULT_DRAFT      16            /* browsers (playa) default to draft-16; 0 = offer all */
 #define DEFAULT_BITRATE    2000000       /* catalog max bitrate (MSF-01 §5.2.22) */
-
-/* On EOS, bound how long the streaming thread waits for the send queue
- * (final GOP + END_OF_TRACK) to drain before teardown. */
-#define EOS_DRAIN_TIMEOUT_US (3 * G_USEC_PER_SEC)
 
 enum
 {
@@ -97,6 +94,7 @@ struct _GstMoqSink
   moq_media_sender_t *sender;
   moq_media_track_t  *track;
   gboolean            started;
+  gboolean            interrupted; /* BaseSink unlock owner, under OBJECT_LOCK */
 
   /* namespace split into borrowed parts (stable for element lifetime) */
   gchar      **ns_tokens;
@@ -332,7 +330,10 @@ gst_moq_sink_start (GstBaseSink *bsink)
   if (!gst_moq_sink_build_namespace (self))
     return FALSE;
 
+  GST_OBJECT_LOCK (self);
   self->ep = NULL;
+  self->interrupted = FALSE;
+  GST_OBJECT_UNLOCK (self);
   self->sender = NULL;
   self->track = NULL;
   self->objects_sent = 0;
@@ -355,7 +356,8 @@ gst_moq_sink_start (GstBaseSink *bsink)
     ec.versions.version_count = 1;
   }
 
-  moq_result_t rc = moq_endpoint_connect (&ec, &self->ep);
+  moq_endpoint_t *ep = NULL;
+  moq_result_t rc = moq_endpoint_connect (&ec, &ep);
   g_free (url);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
@@ -370,12 +372,17 @@ gst_moq_sink_start (GstBaseSink *bsink)
   sc.namespace_.parts = self->ns_bytes;
   sc.namespace_.count = self->ns_count;
 
-  rc = moq_media_sender_attach (self->ep, &sc, &self->sender);
+  rc = moq_media_sender_attach (ep, &sc, &self->sender);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not attach media sender (rc=%d)", (int) rc), (NULL));
     goto fail_ep;
   }
+
+  GST_OBJECT_LOCK (self);
+  self->ep = ep;
+  moq_endpoint_set_interrupted (ep, self->interrupted);
+  GST_OBJECT_UNLOCK (self);
 
   /* The track is added on the first keyframe (see gst_moq_sink_add_track). */
 
@@ -386,9 +393,8 @@ gst_moq_sink_start (GstBaseSink *bsink)
   return TRUE;
 
 fail_ep:
-  moq_endpoint_stop (self->ep);
-  moq_endpoint_destroy (self->ep);
-  self->ep = NULL;
+  moq_endpoint_stop (ep);
+  moq_endpoint_destroy (ep);
 fail_ns:
   g_clear_pointer (&self->ns_tokens, g_strfreev);
   g_clear_pointer (&self->ns_bytes, g_free);
@@ -405,8 +411,12 @@ gst_moq_sink_stop (GstBaseSink *bsink)
     return TRUE;
 
   /* Wake any blocked write(), then tear down child-before-endpoint. */
-  if (self->ep)
-    moq_endpoint_set_interrupted (self->ep, TRUE);
+  GST_OBJECT_LOCK (self);
+  moq_endpoint_t *ep = self->ep;
+  self->ep = NULL;
+  if (ep)
+    moq_endpoint_set_interrupted (ep, TRUE);
+  GST_OBJECT_UNLOCK (self);
 
   if (self->sender) {
     moq_media_sender_stats_t st;
@@ -419,10 +429,9 @@ gst_moq_sink_stop (GstBaseSink *bsink)
     self->sender = NULL;
     self->track = NULL;
   }
-  if (self->ep) {
-    moq_endpoint_stop (self->ep);
-    moq_endpoint_destroy (self->ep);
-    self->ep = NULL;
+  if (ep) {
+    moq_endpoint_stop (ep);
+    moq_endpoint_destroy (ep);
   }
 
   g_clear_pointer (&self->ns_tokens, g_strfreev);
@@ -439,8 +448,11 @@ static gboolean
 gst_moq_sink_unlock (GstBaseSink *bsink)
 {
   GstMoqSink *self = GST_MOQ_SINK (bsink);
+  GST_OBJECT_LOCK (self);
+  self->interrupted = TRUE;
   if (self->ep)
     moq_endpoint_set_interrupted (self->ep, TRUE);
+  GST_OBJECT_UNLOCK (self);
   return TRUE;
 }
 
@@ -448,8 +460,11 @@ static gboolean
 gst_moq_sink_unlock_stop (GstBaseSink *bsink)
 {
   GstMoqSink *self = GST_MOQ_SINK (bsink);
+  GST_OBJECT_LOCK (self);
+  self->interrupted = FALSE;
   if (self->ep)
     moq_endpoint_set_interrupted (self->ep, FALSE);
+  GST_OBJECT_UNLOCK (self);
   return TRUE;
 }
 
@@ -524,12 +539,14 @@ gst_moq_sink_render (GstBaseSink *bsink, GstBuffer *buffer)
   o.presentation_time_us = pts_us;
   o.has_capture_time = FALSE;
 
+  /* The service may release f as soon as ownership transfers. */
+  gsize payload_size = f->map.size;
   moq_result_t rc = moq_media_sender_write (self->sender, self->track, &o);
   switch (rc) {
     case MOQ_OK:
       self->objects_sent++;
       GST_LOG_OBJECT (self, "wrote %s pts=%" G_GUINT64_FORMAT "us (%zu B)",
-          keyframe ? "keyframe" : "delta", pts_us, f->map.size);
+          keyframe ? "keyframe" : "delta", pts_us, payload_size);
       return GST_FLOW_OK;
     case MOQ_ERR_WOULD_BLOCK:
       /* Live policy: a GOP the queue can't hold, or a delta before the
@@ -543,8 +560,9 @@ gst_moq_sink_render (GstBaseSink *bsink, GstBuffer *buffer)
       return GST_FLOW_FLUSHING;
     case MOQ_ERR_CLOSED:
       moq_rcbuf_decref (payload);
-      GST_INFO_OBJECT (self, "endpoint closed; ending stream");
-      return GST_FLOW_EOS;
+      GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+          ("endpoint closed before publisher EOS"), (NULL));
+      return GST_FLOW_ERROR;
     default:
       moq_rcbuf_decref (payload);
       GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
@@ -553,45 +571,36 @@ gst_moq_sink_render (GstBaseSink *bsink, GstBuffer *buffer)
   }
 }
 
-/* Signal a clean end-of-track on EOS so subscribers see TRACK_ENDED rather
- * than a dropped connection, then drain the send queue (bounded) so the
- * final GOP and the END_OF_TRACK reach the wire before stop() tears the
- * endpoint down. */
+/* BaseSink serializes EOS behind render calls. We post no endpoint tasks;
+ * all work-creating sender calls have returned before this barrier. */
+static gboolean
+gst_moq_sink_finish_eos (GstMoqSink *self)
+{
+  gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
+  moq_result_t rc = self->sender && self->ep ? MOQ_OK : MOQ_ERR_CLOSED;
+  if (rc == MOQ_OK && self->track)
+    rc = gst_moq_eos_end (self->ep, self->sender, self->track, deadline);
+  if (rc == MOQ_OK)
+    rc = gst_moq_eos_drain (self->ep, deadline);
+  if (rc != MOQ_OK) {
+    GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+        ("publisher EOS failed or aborted (rc=%d)", (int) rc),
+        ("Local service/stream flush did not complete; teardown may discard the tail"));
+    return FALSE;
+  }
+  GST_INFO_OBJECT (self, "publisher EOS: local service and stream queues flushed");
+  return TRUE;
+}
+
 static gboolean
 gst_moq_sink_event (GstBaseSink *bsink, GstEvent *event)
 {
   GstMoqSink *self = GST_MOQ_SINK (bsink);
-
-  if (GST_EVENT_TYPE (event) == GST_EVENT_EOS && self->sender && self->track) {
-    moq_result_t rc = moq_media_sender_end_track (self->sender, self->track);
-    if (rc == MOQ_OK) {
-      gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
-      for (;;) {
-        moq_media_sender_stats_t st;
-        if (moq_media_sender_get_stats (self->sender, &st, sizeof st) != MOQ_OK)
-          break;
-        if (st.objects_queued == 0) {
-          GST_INFO_OBJECT (self, "ended track on EOS (send queue drained)");
-          break;
-        }
-        if (moq_media_sender_is_fatal (self->sender))
-          break;
-        if (g_get_monotonic_time () >= deadline) {
-          GST_WARNING_OBJECT (self, "EOS drain timed out, %" G_GUINT64_FORMAT
-              " objects still queued", st.objects_queued);
-          break;
-        }
-        g_usleep (5000);
-      }
-      /* Flush the transport send queues so the final GOP and the END_OF_TRACK
-       * actually leave the wire before stop() tears the endpoint down. */
-      if (self->ep)
-        moq_endpoint_drain (self->ep, EOS_DRAIN_TIMEOUT_US);
-    } else if (rc != MOQ_ERR_WRONG_STATE) {  /* WRONG_STATE = already ended */
-      GST_WARNING_OBJECT (self, "end_track failed (rc=%d)", (int) rc);
-    }
+  if (GST_EVENT_TYPE (event) == GST_EVENT_EOS &&
+      !gst_moq_sink_finish_eos (self)) {
+    gst_event_unref (event);
+    return FALSE;
   }
-
   return GST_BASE_SINK_CLASS (gst_moq_sink_parent_class)->event (bsink, event);
 }
 
