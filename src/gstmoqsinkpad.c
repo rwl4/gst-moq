@@ -88,6 +88,7 @@ gst_moq_sink_pad_reset (GstMoqSinkPad *pad)
   pad->track = NULL;
   pad->eos = FALSE;
   pad->flushing = FALSE;
+  pad->flush_pending = FALSE;
   pad->objects_sent = 0;
   pad->base_pts = GST_CLOCK_TIME_NONE;
   gsize max_box = pad->splitter.max_box;

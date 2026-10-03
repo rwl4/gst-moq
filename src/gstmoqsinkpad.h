@@ -29,6 +29,7 @@ struct _GstMoqSinkPad
   moq_media_track_t *track;      /* NULL until the track is added */
   gboolean           eos;
   gboolean           flushing;
+  gboolean           flush_pending;
   guint64            objects_sent;
   GstSegment         segment;
   GstClockID         clock_id;   /* pending sync wait, under OBJECT_LOCK */
@@ -50,7 +51,7 @@ GstMoqSinkPad *gst_moq_sink_pad_new (GstPadTemplate *templ, const gchar *name,
     const gchar *default_track_name, guint64 default_bitrate,
     gsize max_fragment_size);
 
-/* Reset per-stream state (called from start and FLUSH_STOP). */
+/* Reset per-stream state (called for a fresh sender lifetime). */
 void gst_moq_sink_pad_reset (GstMoqSinkPad *pad);
 
 G_END_DECLS

@@ -48,6 +48,7 @@
  * freed sender.
  */
 #include "gstmoqsink.h"
+#include "gstmoqeos.h"
 #include "gstmoqsinkpad.h"
 #include "gstmoqcodec.h"
 
@@ -70,9 +71,11 @@ GST_DEBUG_CATEGORY_STATIC (gst_moq_sink_debug);
 #define DEFAULT_AUDIO_BITRATE 128000
 #define DEFAULT_MAX_FRAGMENT (16u << 20)
 
-/* On EOS, bound how long the streaming thread waits for the send queue
- * (final GOP + END_OF_TRACK) to drain before teardown. */
-#define EOS_DRAIN_TIMEOUT_US (3 * G_USEC_PER_SEC)
+typedef struct {
+  moq_media_track_t *track;
+  gint64 deadline;
+  gboolean accepted;
+} EndRequest;
 
 enum
 {
@@ -90,6 +93,9 @@ enum
   PROP_SAP_TIMELINE,
   PROP_MAX_FRAGMENT_SIZE,
 };
+
+/* Immutable diagnostic snapshot, owned until sender callbacks are settled. */
+typedef struct { gchar *namespace_str; } GstMoqReadyDiagnostic;
 
 struct _GstMoqSink
 {
@@ -110,9 +116,14 @@ struct _GstMoqSink
   /* runtime */
   moq_endpoint_t     *ep;
   moq_media_sender_t *sender;
+  GstMoqReadyDiagnostic *ready_diagnostic;
   GMutex              send_lock;  /* serializes every moq_media_sender_* call */
   gboolean            started;
   gboolean            eos_posted;
+  gboolean            eos_failed;
+  gboolean            state_flushing;
+  guint64             sender_generation;
+  GList              *end_requests; /* sender-owned; survives pad release */
   GstClockTime        latency;    /* from the last GST_EVENT_LATENCY, under OBJECT_LOCK */
   gint                flush_count; /* concurrent FLUSH_START/STOP pads, under OBJECT_LOCK */
 
@@ -294,6 +305,14 @@ gst_moq_sink_write_object (GstMoqSink *self, GstMoqSinkPad *pad,
     moq_rcbuf_decref (payload);
     return GST_FLOW_FLUSHING;
   }
+  GST_OBJECT_LOCK (self);
+  gboolean ended = pad->eos || self->eos_posted;
+  GST_OBJECT_UNLOCK (self);
+  if (ended) {
+    g_mutex_unlock (&self->send_lock);
+    moq_rcbuf_decref (payload);
+    return GST_FLOW_EOS;
+  }
   moq_result_t rc = moq_media_sender_write (self->sender, pad->track, o);
   g_mutex_unlock (&self->send_lock);
   switch (rc) {
@@ -311,8 +330,9 @@ gst_moq_sink_write_object (GstMoqSink *self, GstMoqSinkPad *pad,
       return GST_FLOW_FLUSHING;
     case MOQ_ERR_CLOSED:
       moq_rcbuf_decref (payload);
-      GST_INFO_OBJECT (pad, "endpoint closed; ending stream");
-      return GST_FLOW_EOS;
+      GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+          ("endpoint closed before publisher EOS"), (NULL));
+      return GST_FLOW_ERROR;
     case MOQ_ERR_INVAL:
       moq_rcbuf_decref (payload);
       GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
@@ -386,6 +406,25 @@ gst_moq_sink_unschedule (GstMoqSink *self, GstMoqSinkPad *pad, gboolean flushing
   GST_OBJECT_UNLOCK (self);
 }
 
+/* Cancellation owns OBJECT_LOCK independently of sender serialization, so
+ * flush can interrupt an in-progress final drain. Endpoint publication and
+ * removal share this lock; no callback can touch a freed endpoint. */
+static void
+gst_moq_sink_set_pad_flush (GstMoqSink *self, GstMoqSinkPad *pad, gboolean pending)
+{
+  GST_OBJECT_LOCK (self);
+  if (pad->flush_pending != pending) {
+    self->flush_count += pending ? 1 : -1;
+    pad->flush_pending = pending;
+  }
+  pad->flushing = pending || self->state_flushing;
+  if (pad->flushing && pad->clock_id)
+    gst_clock_id_unschedule (pad->clock_id);
+  if (self->ep)
+    moq_endpoint_set_interrupted (self->ep, self->state_flushing || self->flush_count > 0);
+  GST_OBJECT_UNLOCK (self);
+}
+
 /* -- LOC path (always pad) ----------------------------------------------- */
 
 static gboolean
@@ -437,7 +476,10 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
     g_clear_pointer (&avcc, g_bytes_unref);
     return FALSE;
   }
-  moq_result_t rc = moq_media_sender_add_track (self->sender, &tc, &pad->track);
+  GST_OBJECT_LOCK (self);
+  moq_result_t rc = pad->eos || self->eos_posted ? MOQ_ERR_WRONG_STATE
+      : moq_media_sender_add_track (self->sender, &tc, &pad->track);
+  GST_OBJECT_UNLOCK (self);
   g_mutex_unlock (&self->send_lock);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
@@ -608,7 +650,10 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
     g_free (codec);
     return GST_FLOW_FLUSHING;
   }
-  rc = moq_media_sender_add_track (self->sender, &tc, &pad->track);
+  GST_OBJECT_LOCK (self);
+  rc = pad->eos || self->eos_posted ? MOQ_ERR_WRONG_STATE
+      : moq_media_sender_add_track (self->sender, &tc, &pad->track);
+  GST_OBJECT_UNLOCK (self);
   g_mutex_unlock (&self->send_lock);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
@@ -783,80 +828,143 @@ gst_moq_sink_chain (GstPad *gpad, GstObject *parent, GstBuffer *buffer)
   return gst_moq_sink_chain_loc (self, pad, buffer);
 }
 
-static void
-gst_moq_sink_end_track (GstMoqSink *self, GstMoqSinkPad *pad)
+/* Keep accepted/deferred native obligations independently of Gst pads.
+ * Release serialization between retries so another track can keep writing. */
+static moq_result_t
+gst_moq_sink_end_handle (GstMoqSink *self, moq_media_track_t *track,
+    gint64 deadline, guint64 generation)
 {
-  if (!pad->track)
-    return;
-  g_mutex_lock (&self->send_lock);
-  if (!self->sender) {
-    g_mutex_unlock (&self->send_lock);
-    return;
-  }
-  moq_result_t rc = moq_media_sender_end_track (self->sender, pad->track);
-  g_mutex_unlock (&self->send_lock);
-  if (rc != MOQ_OK && rc != MOQ_ERR_WRONG_STATE)
-    GST_WARNING_OBJECT (pad, "end_track failed (rc=%d)", (int) rc);
-}
-
-/* Drain the send queue (bounded) so the final objects and END_OF_TRACK
- * markers reach the wire before the endpoint is torn down. */
-static void
-gst_moq_sink_drain (GstMoqSink *self)
-{
-  gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
   for (;;) {
-    moq_media_sender_stats_t st;
     g_mutex_lock (&self->send_lock);
-    moq_result_t rc = self->sender
-        ? moq_media_sender_get_stats (self->sender, &st, sizeof st)
-        : MOQ_ERR_CLOSED;
-    g_mutex_unlock (&self->send_lock);
-    if (rc != MOQ_OK)
-      break;
-    if (st.objects_queued == 0) {
-      GST_INFO_OBJECT (self, "send queue drained on EOS");
-      break;
+    if (!self->sender || !self->ep || self->sender_generation != generation) {
+      g_mutex_unlock (&self->send_lock);
+      return MOQ_ERR_CLOSED;
     }
-    g_mutex_lock (&self->send_lock);
-    gboolean fatal = self->sender ? moq_media_sender_is_fatal (self->sender) : TRUE;
-    g_mutex_unlock (&self->send_lock);
-    if (fatal)
-      break;
-    if (g_get_monotonic_time () >= deadline) {
-      GST_WARNING_OBJECT (self, "EOS drain timed out, %" G_GUINT64_FORMAT
-          " objects still queued", st.objects_queued);
-      break;
+    EndRequest *request = NULL;
+    for (GList *l = self->end_requests; l; l = l->next) {
+      EndRequest *r = l->data;
+      if (r->track == track) { request = r; break; }
     }
-    g_usleep (5000);
+    if (!request) {
+      request = g_new0 (EndRequest, 1);
+      request->track = track;
+      request->deadline = deadline;
+      self->end_requests = g_list_append (self->end_requests, request);
+    }
+    guint64 remaining = gst_moq_eos_remaining (request->deadline);
+    moq_result_t rc = request->accepted ? MOQ_OK
+        : moq_media_sender_is_fatal (self->sender) ? MOQ_ERR_CLOSED
+        : !remaining ? MOQ_DONE
+        : moq_media_sender_end_track (self->sender, track);
+    if (rc == MOQ_OK)
+      request->accepted = TRUE;
+    g_mutex_unlock (&self->send_lock);
+    if (rc != MOQ_ERR_WOULD_BLOCK)
+      return rc;
+    g_usleep (MIN (remaining, 5000));
   }
-  if (self->ep)
-    moq_endpoint_drain (self->ep, EOS_DRAIN_TIMEOUT_US);
 }
 
-/* TRUE (once) when every LINKED pad (always + requested) has seen EOS and
- * no other thread has already claimed the EOS post. An unlinked pad (e.g.
- * the always "sink" pad in a CMAF-only pipeline that only uses video_%u/
- * audio_%u) never gets an event pushed into it, so it is excluded from the
- * count entirely; if no pad is linked at all, EOS is never claimed. The
- * all-eos check, the eos_posted check, and claiming it happen under one
- * OBJECT_LOCK so two pads reaching EOS at the same time cannot both drain
- * and post. */
+static moq_result_t
+gst_moq_sink_end_track (GstMoqSink *self, GstMoqSinkPad *pad, gint64 deadline)
+{
+  g_mutex_lock (&self->send_lock);
+  GST_OBJECT_LOCK (self);
+  moq_media_track_t *track = pad->track;
+  guint64 generation = self->sender_generation;
+  GST_OBJECT_UNLOCK (self);
+  g_mutex_unlock (&self->send_lock);
+  return track ? gst_moq_sink_end_handle (self, track, deadline, generation) : MOQ_OK;
+}
+
+static void
+gst_moq_sink_eos_error (GstMoqSink *self, moq_result_t rc)
+{
+  g_mutex_lock (&self->send_lock);
+  self->eos_failed = TRUE;
+  g_mutex_unlock (&self->send_lock);
+  GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+      ("publisher EOS failed or aborted (rc=%d)", (int) rc),
+      ("Local service/stream flush did not complete; teardown may discard the tail"));
+}
+
+static void
+gst_moq_sink_retry_ends (GstMoqSink *self)
+{
+  GArray *pending = g_array_new (FALSE, FALSE, sizeof (EndRequest));
+  g_mutex_lock (&self->send_lock);
+  guint64 generation = self->sender_generation;
+  for (GList *l = self->end_requests; l; l = l->next) {
+    EndRequest *request = l->data;
+    if (!request->accepted)
+      g_array_append_val (pending, *request);
+  }
+  g_mutex_unlock (&self->send_lock);
+  moq_result_t rc = MOQ_OK;
+  for (guint i = 0; i < pending->len && rc == MOQ_OK; i++) {
+    EndRequest *r = &g_array_index (pending, EndRequest, i);
+    rc = gst_moq_sink_end_handle (self, r->track, r->deadline, generation);
+  }
+  g_array_unref (pending);
+  if (rc != MOQ_OK && rc != MOQ_ERR_INTERRUPTED)
+    gst_moq_sink_eos_error (self, rc);
+}
+
+/* The claim closes writer/add gates. No endpoint tasks are posted by this
+ * plugin, so no unexecuted task can create output after this barrier. */
+static gboolean
+gst_moq_sink_drain (GstMoqSink *self, gint64 deadline)
+{
+  g_mutex_lock (&self->send_lock);
+  moq_result_t rc = self->sender && self->ep && !self->eos_failed ? MOQ_OK : MOQ_ERR_CLOSED;
+  for (GList *l = self->end_requests; l && rc == MOQ_OK; l = l->next) {
+    EndRequest *r = l->data;
+    if (!r->accepted) {
+      rc = gst_moq_eos_end (self->ep, self->sender, r->track, MIN (r->deadline, deadline));
+      r->accepted = rc == MOQ_OK;
+    }
+  }
+  if (rc == MOQ_OK)
+    rc = gst_moq_eos_drain (self->ep, deadline);
+  g_mutex_unlock (&self->send_lock);
+  if (rc != MOQ_OK) {
+    gst_moq_sink_eos_error (self, rc);
+    return FALSE;
+  }
+  GST_INFO_OBJECT (self, "publisher EOS: local service and stream queues flushed");
+  gst_element_post_message (GST_ELEMENT (self), gst_message_new_eos (GST_OBJECT (self)));
+  return TRUE;
+}
+
+/* Claim once after all linked pads or pads with native tracks reach EOS and
+ * accept their end requests. An unused unlinked LOC pad is excluded. Taking
+ * send_lock before OBJECT_LOCK matches add/write ordering and prevents a
+ * concurrent EOS handler's unaccepted request from escaping the barrier. */
 static gboolean
 gst_moq_sink_claim_eos (GstMoqSink *self)
 {
   gboolean claim = FALSE;
+  g_mutex_lock (&self->send_lock);
   GST_OBJECT_LOCK (self);
-  if (!self->eos_posted) {
+  if (!self->eos_posted && !self->eos_failed) {
     gboolean all = TRUE;
     gboolean any_linked = FALSE;
     for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next) {
       GstMoqSinkPad *p = GST_MOQ_SINK_PAD (l->data);
-      if (!gst_pad_is_linked (GST_PAD (p)))
+      if (!gst_pad_is_linked (GST_PAD (p)) && !p->track)
         continue;
       any_linked = TRUE;
       if (!p->eos)
         all = FALSE;
+      if (p->track) {
+        gboolean accepted = FALSE;
+        for (GList *l = self->end_requests; l; l = l->next) {
+          EndRequest *r = l->data;
+          if (r->track == p->track && r->accepted)
+            accepted = TRUE;
+        }
+        if (!accepted) all = FALSE;
+      }
     }
     if (all && any_linked) {
       self->eos_posted = TRUE;
@@ -864,6 +972,7 @@ gst_moq_sink_claim_eos (GstMoqSink *self)
     }
   }
   GST_OBJECT_UNLOCK (self);
+  g_mutex_unlock (&self->send_lock);
   return claim;
 }
 
@@ -889,57 +998,47 @@ gst_moq_sink_event (GstPad *gpad, GstObject *parent, GstEvent *event)
     case GST_EVENT_SEGMENT:
       gst_event_copy_segment (event, &pad->segment);
       break;
-    case GST_EVENT_FLUSH_START: {
-      gst_moq_sink_unschedule (self, pad, TRUE);
-      GST_OBJECT_LOCK (self);
-      gboolean was_zero = (self->flush_count == 0);
-      self->flush_count++;
-      GST_OBJECT_UNLOCK (self);
-      /* Only the 0 -> 1 transition sets the endpoint interrupt: with
-       * several pads on one sender, a second concurrent flush must not
-       * clear it while the first is still in progress. self->ep is read
-       * under send_lock, the same lock guarding every other access to it
-       * from the streaming threads (see the file header). */
-      if (was_zero) {
-        g_mutex_lock (&self->send_lock);
-        if (self->ep)
-          moq_endpoint_set_interrupted (self->ep, TRUE);
-        g_mutex_unlock (&self->send_lock);
-      }
+    case GST_EVENT_FLUSH_START:
+      gst_moq_sink_set_pad_flush (self, pad, TRUE);
       break;
-    }
-    case GST_EVENT_FLUSH_STOP: {
-      gst_moq_sink_unschedule (self, pad, FALSE);
-      GST_OBJECT_LOCK (self);
-      if (self->flush_count > 0)
-        self->flush_count--;
-      gboolean now_zero = (self->flush_count == 0);
-      GST_OBJECT_UNLOCK (self);
-      if (now_zero) {
-        g_mutex_lock (&self->send_lock);
-        if (self->ep)
-          moq_endpoint_set_interrupted (self->ep, FALSE);
-        g_mutex_unlock (&self->send_lock);
-      }
-      pad->eos = FALSE;
+    case GST_EVENT_FLUSH_STOP:
+      gst_moq_sink_set_pad_flush (self, pad, FALSE);
       gst_segment_init (&pad->segment, GST_FORMAT_UNDEFINED);
-      GST_OBJECT_LOCK (self);
-      self->eos_posted = FALSE;
-      GST_OBJECT_UNLOCK (self);
+      gst_moq_sink_retry_ends (self);
       break;
-    }
     /* GST_EVENT_LATENCY never reaches here: it is flagged UPSTREAM, so
      * gst_pad_send_event() on a sink pad refuses it before invoking this
      * function. It is intercepted in gst_moq_sink_send_event() instead. */
-    case GST_EVENT_EOS:
+    case GST_EVENT_EOS: {
+      gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
+      /* EOS is serialized with this pad's chain. A buffered partial box or
+       * unpaired moof must not disappear behind a successful native drain. */
+      if (pad->packaging == MOQ_MEDIA_PACKAGING_CMAF &&
+          (pad->splitter.buf->len != 0 || pad->splitter.moof != NULL)) {
+        g_mutex_lock (&self->send_lock);
+        self->eos_failed = TRUE;
+        g_mutex_unlock (&self->send_lock);
+        GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+            ("incomplete fragmented MP4 at EOS on pad %s", GST_PAD_NAME (pad)),
+            ("A partial box or moof without mdat remains buffered"));
+        gst_event_unref (event);
+        return FALSE;
+      }
+      GST_OBJECT_LOCK (self);
       pad->eos = TRUE;
-      gst_moq_sink_end_track (self, pad);
-      if (gst_moq_sink_claim_eos (self)) {
-        gst_moq_sink_drain (self);
-        gst_element_post_message (GST_ELEMENT (self),
-            gst_message_new_eos (GST_OBJECT (self)));
+      GST_OBJECT_UNLOCK (self);
+      moq_result_t rc = gst_moq_sink_end_track (self, pad, deadline);
+      if (rc != MOQ_OK) {
+        gst_moq_sink_eos_error (self, rc);
+        gst_event_unref (event);
+        return FALSE;
+      }
+      if (gst_moq_sink_claim_eos (self) && !gst_moq_sink_drain (self, deadline)) {
+        gst_event_unref (event);
+        return FALSE;
       }
       break;
+    }
     default:
       break;
   }
@@ -1023,12 +1122,36 @@ gst_moq_sink_release_pad (GstElement *element, GstPad *gpad)
   GstMoqSink *self = GST_MOQ_SINK (element);
   GstMoqSinkPad *pad = GST_MOQ_SINK_PAD (gpad);
   gst_moq_sink_unschedule (self, pad, TRUE);
-  gst_moq_sink_end_track (self, pad);
   gst_pad_set_active (gpad, FALSE);
+  gst_moq_sink_set_pad_flush (self, pad, FALSE);
+  gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
+  moq_result_t rc = gst_moq_sink_end_track (self, pad, deadline);
+  if (rc != MOQ_OK && rc != MOQ_ERR_INTERRUPTED)
+    gst_moq_sink_eos_error (self, rc);
   gst_element_remove_pad (element, gpad);
+  if (gst_moq_sink_claim_eos (self))
+    gst_moq_sink_drain (self, deadline);
 }
 
 /* -- lifecycle ------------------------------------------------------------ */
+
+/* Network callback: no waiting, locks or dependency on self->sender. */
+static void
+gst_moq_sink_on_ready (void *ctx, moq_media_sender_t *sender)
+{
+  GstMoqReadyDiagnostic *diagnostic = ctx;
+  (void) sender;
+  GST_INFO ("native sender ready namespace=%s", diagnostic->namespace_str);
+}
+
+static void
+gst_moq_sink_ready_diagnostic_free (GstMoqReadyDiagnostic *diagnostic)
+{
+  if (diagnostic) {
+    g_free (diagnostic->namespace_str);
+    g_free (diagnostic);
+  }
+}
 
 static gboolean
 gst_moq_sink_start (GstMoqSink *self)
@@ -1036,11 +1159,11 @@ gst_moq_sink_start (GstMoqSink *self)
   if (!gst_moq_sink_build_namespace (self))
     return FALSE;
 
-  self->ep = NULL;
-  self->sender = NULL;
   self->eos_posted = FALSE;
+  self->eos_failed = FALSE;
   GST_OBJECT_LOCK (self);
   self->flush_count = 0;
+  self->state_flushing = FALSE;
   for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
     gst_moq_sink_pad_reset (GST_MOQ_SINK_PAD (l->data));
   GST_OBJECT_UNLOCK (self);
@@ -1062,7 +1185,8 @@ gst_moq_sink_start (GstMoqSink *self)
     ec.versions.version_count = 1;
   }
 
-  moq_result_t rc = moq_endpoint_connect (&ec, &self->ep);
+  moq_endpoint_t *ep = NULL;
+  moq_result_t rc = moq_endpoint_connect (&ec, &ep);
   g_free (url);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
@@ -1072,13 +1196,18 @@ gst_moq_sink_start (GstMoqSink *self)
   }
 
   moq_media_sender_cfg_t sc;
-  moq_media_sender_cfg_init_live (&sc);
+  moq_media_sender_cfg_init_live_sized (&sc, sizeof sc);
+  moq_media_sender_callbacks_init_sized (&sc.callbacks, sizeof sc.callbacks);
+  GstMoqReadyDiagnostic *diagnostic = g_new0 (GstMoqReadyDiagnostic, 1);
+  diagnostic->namespace_str = g_strdup (self->namespace_str);
+  sc.callbacks.ctx = diagnostic;
+  sc.callbacks.on_ready = gst_moq_sink_on_ready;
   sc.endpoint = NULL;
   sc.namespace_.parts = self->ns_bytes;
   sc.namespace_.count = self->ns_count;
 
   moq_media_sender_t *sender = NULL;
-  rc = moq_media_sender_attach (self->ep, &sc, &sender);
+  rc = moq_media_sender_attach (ep, &sc, &sender);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not attach media sender (rc=%d)", (int) rc), (NULL));
@@ -1086,6 +1215,12 @@ gst_moq_sink_start (GstMoqSink *self)
   }
   g_mutex_lock (&self->send_lock);
   self->sender = sender;
+  self->ready_diagnostic = diagnostic;
+  self->sender_generation++;
+  GST_OBJECT_LOCK (self);
+  self->ep = ep;
+  moq_endpoint_set_interrupted (ep, self->state_flushing || self->flush_count > 0);
+  GST_OBJECT_UNLOCK (self);
   g_mutex_unlock (&self->send_lock);
 
   self->started = TRUE;
@@ -1094,9 +1229,9 @@ gst_moq_sink_start (GstMoqSink *self)
   return TRUE;
 
 fail_ep:
-  moq_endpoint_stop (self->ep);
-  moq_endpoint_destroy (self->ep);
-  self->ep = NULL;
+  moq_endpoint_stop (ep);
+  moq_endpoint_destroy (ep);
+  gst_moq_sink_ready_diagnostic_free (diagnostic);
 fail_ns:
   g_clear_pointer (&self->ns_tokens, g_strfreev);
   g_clear_pointer (&self->ns_bytes, g_free);
@@ -1110,8 +1245,13 @@ gst_moq_sink_stop (GstMoqSink *self)
   if (!self->started)
     return;
 
-  if (self->ep)
-    moq_endpoint_set_interrupted (self->ep, TRUE);
+  g_mutex_lock (&self->send_lock);
+  GST_OBJECT_LOCK (self);
+  moq_endpoint_t *ep = self->ep;
+  self->ep = NULL;
+  if (ep)
+    moq_endpoint_set_interrupted (ep, TRUE);
+  GST_OBJECT_UNLOCK (self);
 
   if (self->sender) {
     moq_media_sender_stats_t st;
@@ -1119,22 +1259,25 @@ gst_moq_sink_stop (GstMoqSink *self)
      * critical section so a concurrent streaming-thread call (which only
      * ever checks self->sender under this same lock) can never observe a
      * freed sender. */
-    g_mutex_lock (&self->send_lock);
     moq_result_t stats_rc = moq_media_sender_get_stats (self->sender, &st, sizeof st);
     moq_media_sender_destroy (self->sender);
     self->sender = NULL;
-    g_mutex_unlock (&self->send_lock);
+    /* detach/destruction settles callbacks before the diagnostic is freed. */
+    gst_moq_sink_ready_diagnostic_free (self->ready_diagnostic);
+    self->ready_diagnostic = NULL;
     if (stats_rc == MOQ_OK)
       GST_INFO_OBJECT (self, "sender stats: written=%" G_GUINT64_FORMAT
           " sent=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT
           " dropped=%" G_GUINT64_FORMAT, st.objects_written, st.objects_sent,
           st.objects_queued, st.objects_dropped);
   }
-  if (self->ep) {
-    moq_endpoint_stop (self->ep);
-    moq_endpoint_destroy (self->ep);
-    self->ep = NULL;
+  g_list_free_full (self->end_requests, g_free);
+  self->end_requests = NULL;
+  if (ep) {
+    moq_endpoint_stop (ep);
+    moq_endpoint_destroy (ep);
   }
+  g_mutex_unlock (&self->send_lock);
 
   GST_OBJECT_LOCK (self);
   for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
@@ -1158,17 +1301,22 @@ gst_moq_sink_change_state (GstElement *element, GstStateChange transition)
       if (!gst_moq_sink_start (self))
         return GST_STATE_CHANGE_FAILURE;
       break;
+    case GST_STATE_CHANGE_READY_TO_PAUSED:
+      if (!self->started && !gst_moq_sink_start (self))
+        return GST_STATE_CHANGE_FAILURE;
+      break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       GST_OBJECT_LOCK (self);
+      self->state_flushing = TRUE;
       for (GList *l = element->sinkpads; l; l = l->next) {
         GstMoqSinkPad *p = GST_MOQ_SINK_PAD (l->data);
         p->flushing = TRUE;
         if (p->clock_id)
           gst_clock_id_unschedule (p->clock_id);
       }
-      GST_OBJECT_UNLOCK (self);
       if (self->ep)
         moq_endpoint_set_interrupted (self->ep, TRUE);
+      GST_OBJECT_UNLOCK (self);
       break;
     default:
       break;
@@ -1181,12 +1329,17 @@ gst_moq_sink_change_state (GstElement *element, GstStateChange transition)
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
       GST_OBJECT_LOCK (self);
+      self->state_flushing = FALSE;
       for (GList *l = element->sinkpads; l; l = l->next)
-        GST_MOQ_SINK_PAD (l->data)->flushing = FALSE;
+        GST_MOQ_SINK_PAD (l->data)->flushing = GST_MOQ_SINK_PAD (l->data)->flush_pending;
       self->eos_posted = FALSE;
-      GST_OBJECT_UNLOCK (self);
       if (self->ep)
-        moq_endpoint_set_interrupted (self->ep, FALSE);
+        moq_endpoint_set_interrupted (self->ep, self->flush_count > 0);
+      GST_OBJECT_UNLOCK (self);
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      if (ret != GST_STATE_CHANGE_FAILURE)
+        gst_moq_sink_stop (self);
       break;
     case GST_STATE_CHANGE_READY_TO_NULL:
       gst_moq_sink_stop (self);

@@ -86,6 +86,8 @@ struct _GstMoqSrc
   moq_endpoint_t       *ep;
   moq_media_receiver_t *receiver;
   moq_media_track_t    *want_track;   /* handle matching track-name, or NULL */
+  gboolean              want_track_ended;
+  gboolean              selection_failed;
   gboolean              started;
   gboolean              caps_pushed;
   gboolean              catalog_ready;
@@ -164,6 +166,22 @@ gst_moq_src_build_namespace (GstMoqSrc *self)
 
 /* -- GstBaseSrc / GstPushSrc vmethods ------------------------------------ */
 
+static void
+gst_moq_src_log_terminal (GstMoqSrc *self)
+{
+  moq_endpoint_terminal_t terminal = { 0 };
+  moq_result_t rc = moq_endpoint_get_terminal (self->ep, &terminal,
+      sizeof terminal);
+  if (rc != MOQ_OK)
+    GST_INFO_OBJECT (self, "endpoint terminal unavailable getter_rc=%d", (int) rc);
+  else if (terminal.reason == MOQ_ENDPOINT_TERMINAL_NONE)
+    GST_INFO_OBJECT (self, "endpoint terminal unclassified reason=0 detail=%" G_GUINT64_FORMAT,
+        (guint64) terminal.detail_code);
+  else
+    GST_INFO_OBJECT (self, "endpoint terminal reason=%u detail=%" G_GUINT64_FORMAT,
+        (guint) terminal.reason, (guint64) terminal.detail_code);
+}
+
 static gboolean
 gst_moq_src_start (GstBaseSrc *bsrc)
 {
@@ -175,6 +193,8 @@ gst_moq_src_start (GstBaseSrc *bsrc)
   self->ep = NULL;
   self->receiver = NULL;
   self->want_track = NULL;
+  self->want_track_ended = FALSE;
+  self->selection_failed = FALSE;
   self->caps_pushed = FALSE;
   self->catalog_ready = FALSE;
   self->objects_recv = 0;
@@ -224,10 +244,11 @@ gst_moq_src_start (GstBaseSrc *bsrc)
   rcfg.endpoint = NULL;         /* attach: we own the endpoint above */
   rcfg.namespace_.parts = self->ns_bytes;
   rcfg.namespace_.count = self->ns_count;
-  rcfg.auto_subscribe = TRUE;
+  rcfg.auto_subscribe = FALSE;
 
   rc = moq_media_receiver_attach (self->ep, &rcfg, &self->receiver);
   if (rc != MOQ_OK) {
+    gst_moq_src_log_terminal (self);
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_READ,
         ("could not attach media receiver (rc=%d)", (int) rc), (NULL));
     goto fail_ep;
@@ -382,9 +403,22 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
               d->name.data ? (const gchar *) d->name.data : "",
               d->name.data ? d->name.len : 0);
         }
-        if (d && d->name.len == strlen (self->track_name) &&
+        if (d && d->name.data && !self->want_track &&
+            d->name.len == strlen (self->track_name) &&
             memcmp (d->name.data, self->track_name, d->name.len) == 0) {
+          moq_result_t rc = moq_media_receiver_subscribe_track (
+              self->receiver, ev.track, NULL);
+          if (rc != MOQ_OK) {
+            GST_ELEMENT_ERROR (self, RESOURCE, READ,
+                ("could not subscribe to track \"%s\" (rc=%d)",
+                    self->track_name, (int) rc), (NULL));
+            self->selection_failed = TRUE;
+            break;
+          }
+          GST_INFO_OBJECT (self, "selected endpoint negotiated draft=%u",
+              (guint) moq_endpoint_negotiated_version (self->ep));
           self->want_track = ev.track;
+          self->want_track_ended = FALSE;
           self->track_ever_seen = TRUE;
           self->want_init = d->init_data;
           self->init_pushed = FALSE;
@@ -416,13 +450,14 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
         }
         break;
       }
+      case MOQ_MEDIA_TRACK_ENDED:
       case MOQ_MEDIA_TRACK_REMOVED:
         if (ev.track && ev.track == self->want_track) {
-          GST_INFO_OBJECT (self, "wanted track \"%s\" removed from the catalog",
-              self->track_name);
-          self->want_track = NULL;
-          self->want_init = (moq_bytes_t) {0};
-          self->init_pushed = FALSE;
+          self->want_track_ended = TRUE;
+          GST_INFO_OBJECT (self, "selected-track terminal event kind=%d name=%s",
+              (int) ev.kind, self->track_name);
+          /* Handles and descriptors remain stable until receiver teardown.
+           * Preserve CMAF init and pending/queued tails after removal too. */
         }
         break;
       case MOQ_MEDIA_CATALOG_READY:
@@ -449,7 +484,7 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
   for (;;) {
     gst_moq_src_drain_track_events (self);
 
-    if (self->negotiation_failed)
+    if (self->negotiation_failed || self->selection_failed)
       return GST_FLOW_ERROR;
 
     if (!self->caps_pushed) {
@@ -461,8 +496,18 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
       }
     }
 
+    moq_media_object_t obj;
+    moq_result_t rc =
+        moq_media_receiver_poll_object (self->receiver, &obj, sizeof (obj));
+
+    if (rc == MOQ_ERR_INTERRUPTED)
+      return GST_FLOW_FLUSHING;
+
     if (!self->want_track && !self->track_ever_seen &&
+        (rc == MOQ_OK || rc == MOQ_DONE) &&
         g_get_monotonic_time () >= self->discover_deadline) {
+      if (rc == MOQ_OK)
+        moq_media_object_cleanup (&obj);
       GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
           ("track \"%s\" was not announced within %u ms (catalog tracks: %s)",
               self->track_name, self->discovery_timeout_ms,
@@ -471,16 +516,12 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
       return GST_FLOW_ERROR;
     }
 
-    moq_media_object_t obj;
-    moq_result_t rc =
-        moq_media_receiver_poll_object (self->receiver, &obj, sizeof (obj));
-
     if (rc == MOQ_OK) {
       /* Every object's track is announced before it is pollable, so a NULL
        * want_track here means the requested track-name has not matched
        * anything yet -- drop until it resolves (or the discovery deadline
        * fails the pipeline) rather than guessing at an unrelated track. */
-      if (obj.track != self->want_track) {
+      if (!self->want_track || obj.track != self->want_track) {
         moq_media_object_cleanup (&obj);
         continue;
       }
@@ -549,6 +590,11 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
     if (rc == MOQ_ERR_INTERRUPTED)
       return GST_FLOW_FLUSHING;
 
+    if (self->ep && (rc == MOQ_ERR_CLOSED ||
+            moq_media_receiver_is_fatal (self->receiver))) {
+      gst_moq_src_log_terminal (self);
+    }
+
     if (moq_media_receiver_is_fatal (self->receiver)) {
       GST_ELEMENT_ERROR (self, RESOURCE, READ,
           ("media receiver failed (code=%" G_GUINT64_FORMAT ")",
@@ -559,6 +605,12 @@ gst_moq_src_create (GstPushSrc *psrc, GstBuffer **out)
 
     if (rc == MOQ_ERR_CLOSED) {
       GST_INFO_OBJECT (self, "endpoint closed; sending EOS");
+      return GST_FLOW_EOS;
+    }
+
+    if (rc == MOQ_DONE && self->want_track_ended) {
+      GST_INFO_OBJECT (self, "selected-track queue drained; sending EOS name=%s",
+          self->track_name);
       return GST_FLOW_EOS;
     }
 

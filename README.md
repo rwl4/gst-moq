@@ -30,7 +30,7 @@ On Linux the plugin is a shared object, so every static library it links
 for WebTransport) and libmoq into one prefix, then point CMake at it:
 
 ```sh
-cmake -B build -DCMAKE_PREFIX_PATH=<moq5-prefix>   # auto-found at ../../local-prefix
+cmake -B build -DCMAKE_PREFIX_PATH=<moq5-prefix>   # auto-found at ../local-prefix
 cmake --build build
 export GST_PLUGIN_PATH="$PWD/build/plugins"
 gst-inspect-1.0 moqsink
@@ -70,7 +70,10 @@ negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
 `sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout`,
 `latency` (ms reported through the LATENCY query so synced sinks absorb
 network jitter instead of dropping late frames; default 200) and `caps`,
-which is now optional — it is derived from the catalog when omitted.
+which is optional for CMAF and H.264 LOC — it is derived from the catalog
+when omitted. Automatic H.264 LOC caps describe Annex B access units;
+length-prefixed payloads and catalog-only decoder configuration are not yet
+handled automatically. Other LOC codecs require explicit compatible caps.
 
 `moqsink` is a plain `GstElement`, not a `GstBaseSink`: it does not preroll,
 so `READY` to `PAUSED` returns immediately instead of waiting for the first
@@ -121,11 +124,14 @@ gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example tra
 
 ## Status
 
-H.264 byte-stream over WebTransport, validated end to end through a MoQ relay
-with both `moqsrc` and the Red5 Playa browser player (draft-16 and draft-18).
-CMAF (fragmented MP4) video plus AAC or Opus audio under a CMSF-01 catalog is
-validated the same way, with `moqsrc` deriving caps from the catalog. A
-raw-QUIC (`moqt://`) transport option is a follow-up.
+The plugin supports H.264 Annex B LOC publishing and CMAF video/audio under a
+CMSF-01 catalog. CMAF codec strings cover AVC, AAC and Opus; automatic LOC
+receiver caps cover H.264 only. Finite draft-16 LOC plus CMAF/AAC delivery,
+independent track EOS and publisher drain passed through the Chicago and London
+moqx relays with the exact private SDK described below. Separately captured
+CMAF AVC/AAC from Playa decoded offline. These results do not qualify arbitrary
+LOC framing, Opus playback, draft-18 finite EOS or every relay implementation.
+A raw-QUIC (`moqt://`) transport option is a follow-up.
 
 ## Author
 
@@ -134,3 +140,27 @@ Raymond Lucke and the Red5 Team
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+Publisher EOS uses one three-second acceptance/drain budget and requires MOQ5's
+service-aware endpoint drain. Failure or cancellation posts an error rather than
+successful EOS; local flush does not prove peer receipt or decode. Released pads
+retain their native end obligations until sender teardown. FLUSH_STOP does not
+reopen an ended track. Returning through READY creates a fresh sender lifetime.
+
+The local fixture in `tests/local_fixture.py` generates independent LOC access
+units and CMAF init/fragments, pins their SHA256 inventory, and validates output
+through an offline appsrc/appsink replay. Its `plan` command constructs one
+publisher and both receivers at NULL without connecting. `publish`/`receive`
+require explicit traffic authorization and accept `--draft 16` or `--draft 18`,
+with draft16 as the default,
+TLS verification and a fresh per-run readiness directory. Priming media is part
+of the inventory; the counted suffix waits for real receiver priming receipts.
+Public TRACK_ENDED evidence distinguishes service end from local timeout/close,
+but the native event also covers rejection and is not wire-marker provenance.
+
+The EOS contract requires MOQ5's service-aware endpoint drain. The tested SDK is
+a private delivery based on f9e20ebf with additional native changes, not a
+released MOQ5 package; older transport-only drain implementations are insufficient.
+Consumers must supply a MOQ5 SDK with these service-drain guarantees; a public
+minimum revision has not yet been established. Relay catalog bootstrap support
+is a separate requirement for playback against a given relay.

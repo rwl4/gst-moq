@@ -9,7 +9,7 @@
 # in docs/relay-playback-debugging.md. What this test guards is: the
 # element does not crash, deadlock, or trip a GLib critical while a
 # connection attempt fails and the pipeline is torn down.
-set -uo pipefail
+set -euo pipefail
 export GST_PLUGIN_PATH="$1"
 
 # Capture full output before grepping: `producer | grep -q pattern` under
@@ -33,19 +33,15 @@ echo "$moqsrc_info" | grep -q "MoQ source"
 # (the `timeout` wrapper turns a hang into exit 124, which is treated as a
 # failure below).
 echo "-- CMAF publish smoke --"
-G_DEBUG=fatal-criticals timeout 60 gst-launch-1.0 -e moqsink name=ms \
+if G_DEBUG=fatal-criticals timeout 60 gst-launch-1.0 -e moqsink name=ms \
     host=127.0.0.1 port=1 relay-path=/moq \
     videotestsrc num-buffers=30 ! x264enc tune=zerolatency key-int-max=30 \
     ! h264parse ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss \
     ! ms.video_0
-rc=$?
+then rc=0; else rc=$?; fi
 echo "CMAF publish pipeline exit code: $rc"
-if [ "$rc" -eq 124 ]; then
-  echo "FAIL: CMAF publish pipeline timed out (hang)"
-  exit 1
-fi
-if [ "$rc" -ge 128 ]; then
-  echo "FAIL: CMAF publish pipeline died on a signal (exit $rc)"
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+  echo "FAIL: unexpected CMAF publish exit $rc (only 0 or 1 allowed)"
   exit 1
 fi
 
@@ -58,7 +54,7 @@ fi
 # NULL_TO_READY's connect failure is allowed to fail the change outright).
 echo "-- moqsink state cycle --"
 if python3 -c "import gi; gi.require_version('Gst', '1.0')" >/dev/null 2>&1; then
-  G_DEBUG=fatal-criticals timeout 30 python3 - "$GST_PLUGIN_PATH" <<'EOF'
+  if G_DEBUG=fatal-criticals timeout 30 python3 - "$GST_PLUGIN_PATH" <<'EOF'
 import sys
 import gi
 gi.require_version("Gst", "1.0")
@@ -75,9 +71,19 @@ sink.set_property("host", "127.0.0.1")
 sink.set_property("port", 1)
 sink.set_property("relay-path", "/moq")
 
+# If connection acquisition fails, exercise cleanup without retrying start.
+first = sink.set_state(Gst.State.READY)
+print(f"NULL->READY: {first}")
+if first == Gst.StateChangeReturn.FAILURE:
+    last = sink.set_state(Gst.State.NULL)
+    if last == Gst.StateChangeReturn.FAILURE:
+        print("FAIL: failed-start cleanup returned FAILURE")
+        sys.exit(1)
+    print("state cycle OK (connection refused; cleanup checked)")
+    sys.exit(0)
+
 results = {}
 for name, state in (
-    ("NULL->READY", Gst.State.READY),
     ("READY->PAUSED", Gst.State.PAUSED),
     ("PAUSED->READY", Gst.State.READY),
     ("READY->NULL", Gst.State.NULL),
@@ -89,18 +95,15 @@ for name, state in (
 # NULL_TO_READY dials the (refused) relay in start(); a FAILURE there is
 # expected and recorded, not asserted. Every other transition must not fail.
 failed = [n for n, r in results.items()
-          if r == Gst.StateChangeReturn.FAILURE and n != "NULL->READY"]
+          if r == Gst.StateChangeReturn.FAILURE]
 if failed:
     print(f"FAIL: unexpected state-change failures: {failed}")
     sys.exit(1)
 
-if results["NULL->READY"] == Gst.StateChangeReturn.FAILURE:
-    print("NOTE: NULL->READY failed as expected (relay connection refused)")
-
 print("state cycle OK")
 sys.exit(0)
 EOF
-  rc=$?
+  then rc=0; else rc=$?; fi
   echo "moqsink state cycle exit code: $rc"
   if [ "$rc" -eq 124 ]; then
     echo "FAIL: moqsink state cycle timed out (hang)"
@@ -112,17 +115,13 @@ EOF
   fi
 else
   echo "PyGObject unavailable; falling back to a short publish run"
-  G_DEBUG=fatal-criticals timeout 30 gst-launch-1.0 \
+  if G_DEBUG=fatal-criticals timeout 30 gst-launch-1.0 \
       videotestsrc num-buffers=5 ! x264enc ! h264parse \
       ! moqsink host=127.0.0.1 port=1
-  rc=$?
+  then rc=0; else rc=$?; fi
   echo "fallback publish run exit code: $rc"
-  if [ "$rc" -eq 124 ]; then
-    echo "FAIL: fallback publish run timed out (hang)"
-    exit 1
-  fi
-  if [ "$rc" -ge 128 ]; then
-    echo "FAIL: fallback publish run died on a signal (exit $rc)"
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+    echo "FAIL: unexpected fallback publish exit $rc (only 0 or 1 allowed)"
     exit 1
   fi
 fi

@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
+# Let CMake de-duplicate static archives when the linker supports it, while
+# retaining repetitions required by traditional linkers.
+if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+endif()
+if(POLICY CMP0179)
+    cmake_policy(SET CMP0179 NEW)
+endif()
 project(gst-moq C)
 
 #
@@ -8,7 +16,7 @@ project(gst-moq C)
 # WebTransport (picoquic + h3zero, ALPN moqt-16).
 #
 # Build against the system GStreamer (Homebrew 1.28) via pkg-config and
-# the installed libmoq in ../../local-prefix via CMake config packages.
+# the installed libmoq in ../local-prefix via CMake config packages.
 # The picoquic adapters ship no .pc file, so find_package is the way to
 # resolve the transitive picoquic -> picohttp -> picotls -> OpenSSL link
 # chain that the service tier's transport facades pull in.
@@ -21,7 +29,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Default CMAKE_PREFIX_PATH to the repo's local-prefix so a plain
 # `cmake -B build` works without extra flags. Override on the command
 # line with -DCMAKE_PREFIX_PATH=... if libmoq is installed elsewhere.
-get_filename_component(_repo_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+get_filename_component(_repo_root "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 if(NOT CMAKE_PREFIX_PATH)
     set(CMAKE_PREFIX_PATH "${_repo_root}/local-prefix")
 endif()
@@ -83,6 +91,26 @@ set_target_properties(gstmoq PROPERTIES
 include(CTest)
 if(BUILD_TESTING)
     pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
+    add_executable(inspect_cmaf_fixture tests/inspect_cmaf_fixture.c
+        src/gstmoqfmp4.c src/gstmoqcodec.c)
+    target_include_directories(inspect_cmaf_fixture PRIVATE src)
+    target_link_libraries(inspect_cmaf_fixture PRIVATE PkgConfig::GLIB moq::cmaf moq::core)
+    target_compile_options(inspect_cmaf_fixture PRIVATE -Wall -Wextra)
+    add_executable(test_sink_recovery tests/test_sink_recovery.c
+        src/gstmoqsinkpad.c src/gstmoqcodec.c src/gstmoqfmp4.c)
+    target_include_directories(test_sink_recovery PRIVATE
+        $<TARGET_PROPERTY:moq::service,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(test_sink_recovery PRIVATE PkgConfig::GST moq::cmaf moq::core)
+    target_compile_options(test_sink_recovery PRIVATE -Wall -Wextra)
+    add_test(NAME sink_recovery COMMAND test_sink_recovery)
+    set_tests_properties(sink_recovery PROPERTIES TIMEOUT 10)
+    add_executable(test_src_delivery tests/test_src_delivery.c)
+    target_include_directories(test_src_delivery PRIVATE
+        $<TARGET_PROPERTY:moq::service,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(test_src_delivery PRIVATE PkgConfig::GST)
+    target_compile_options(test_src_delivery PRIVATE -Wall -Wextra)
+    add_test(NAME src_delivery COMMAND test_src_delivery)
+    set_tests_properties(src_delivery PROPERTIES TIMEOUT 10)
 
     add_executable(test_fmp4_splitter
         tests/test_fmp4_splitter.c
