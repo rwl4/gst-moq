@@ -69,6 +69,12 @@ GST_DEBUG_CATEGORY_STATIC (gst_moq_sink_debug);
 #define DEFAULT_DRAFT      16            /* browsers (playa) default to draft-16; 0 = offer all */
 #define DEFAULT_BITRATE    2000000       /* catalog max bitrate (MSF-01 §5.2.22) */
 #define DEFAULT_AUDIO_BITRATE 128000
+#define DEFAULT_AUDIO_TRACK_NAME "audio"
+/* LOC audio group cadence. Every AAC frame is independently decodable, so any
+ * object could open a group; one group per ~21 ms frame would give a relay ~47
+ * groups/s per track. A group per second matches both the video path's usual
+ * GOP cadence and what the CMAF path produces (one fragment, one group). */
+#define LOC_AUDIO_GROUP_US 1000000
 #define DEFAULT_MAX_FRAGMENT (16u << 20)
 
 typedef struct {
@@ -76,6 +82,14 @@ typedef struct {
   gint64 deadline;
   gboolean accepted;
 } EndRequest;
+
+/* How long the first pad to produce a track waits for the remaining LINKED pads
+ * to produce theirs before the sender is attached anyway. It bounds the case
+ * where a pad is linked but never delivers (a silent or absent elementary
+ * stream that also never sends EOS); a pad that EOSes or flushes drops out of
+ * the barrier immediately, so the normal cost is the gap between the pads'
+ * first keyframes, not this timeout. */
+#define DEFAULT_CATALOG_WAIT_MS 3000
 
 enum
 {
@@ -92,10 +106,31 @@ enum
   PROP_SYNC,
   PROP_SAP_TIMELINE,
   PROP_MAX_FRAGMENT_SIZE,
+  PROP_PUBLISH_TRACKS,
+  PROP_CATALOG_REFRESH_MS,
+  PROP_CATALOG_WAIT_MS,
+  PROP_LOC_AUDIO_GROUP_MS,
 };
 
 /* Immutable diagnostic snapshot, owned until sender callbacks are settled. */
 typedef struct { gchar *namespace_str; } GstMoqReadyDiagnostic;
+
+typedef struct {
+  moq_media_track_cfg_t cfg;
+  GstMoqSinkPad *pad;
+  GBytes *name, *codec, *channels, *init;
+  moq_media_track_t *track;
+} PreparedTrack;
+
+typedef struct {
+  GMutex lock;
+  GCond cond;
+  gboolean done, running, cancelled;
+  moq_result_t result;
+  moq_media_sender_cfg_t cfg;
+  moq_media_sender_t *sender;
+  GPtrArray *tracks;
+} SenderStartup;
 
 struct _GstMoqSink
 {
@@ -131,7 +166,39 @@ struct _GstMoqSink
   moq_bytes_t *ns_bytes;
   guint        ns_count;
 
-  GstMoqSinkPad *locpad;    /* the always pad */
+  /* Wall-clock anchor for the LOC Capture Timestamp (LOC-01 2.3.1.1 is epoch
+   * microseconds, not stream-relative). Taken once, from whichever LOC pad sees
+   * a timestamped buffer first, and shared by both: anchoring each pad
+   * separately would offset audio from video by the gap between their first
+   * buffers. Guarded by OBJECT_LOCK. */
+  gboolean     publish_tracks;   /* push (PUBLISH) instead of announce-and-wait */
+  guint        catalog_refresh_ms; /* 0 = never republish the catalog */
+  guint        catalog_wait_ms;  /* how long to wait for every linked pad's track */
+  guint        loc_audio_group_ms; /* LOC audio group length */
+
+  /* Initial-catalog barrier. The sender is attached, and every track added, in
+   * one step once all linked pads have prepared their track -- see
+   * gst_moq_sink_await_tracks for why. Guarded by track_lock, which is taken
+   * OUTSIDE both OBJECT_LOCK and send_lock. */
+  GMutex       track_lock;
+  GCond        track_cond;
+  GPtrArray   *preparing_tracks; /* app-thread snapshot, under track_lock */
+  gboolean     tracks_committed;
+  gboolean     tracks_failed;
+
+  /* Raw PTS of the most recent VIDEO group start, published so the audio pad
+   * can open its group at the same instant (see gst_moq_sink_chain_loc).
+   * Compared by identity only -- the two pads rebase presentation time
+   * separately, so magnitudes are not comparable across them. Guarded by
+   * OBJECT_LOCK. */
+  GstClockTime loc_video_group_pts;
+
+  gboolean     loc_anchored;
+  gint64       loc_anchor_epoch_us;
+  GstClockTime loc_anchor_pts;
+
+  GstMoqSinkPad *locpad;        /* the always video (H.264) pad */
+  GstMoqSinkPad *locpad_audio;  /* the always audio (AAC) pad */
   guint          pad_serial;
 };
 
@@ -140,8 +207,17 @@ G_DEFINE_TYPE (GstMoqSink, gst_moq_sink, GST_TYPE_ELEMENT)
 static GstStaticPadTemplate sink_template =
 GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("video/x-h264, "
-        "stream-format = (string) byte-stream, "
+        "stream-format = (string) { avc, byte-stream }, "
         "alignment = (string) au"));
+
+/* The second always pad: AAC access units, one LOC object per frame. Raw AAC
+ * (no ADTS) because LOC carries the decoder config out of band, in the
+ * catalog's initData, exactly as the video pad carries avcC there. */
+static GstStaticPadTemplate audio_loc_template =
+GST_STATIC_PAD_TEMPLATE ("audio", GST_PAD_SINK, GST_PAD_ALWAYS,
+    GST_STATIC_CAPS ("audio/mpeg, "
+        "mpegversion = (int) 4, "
+        "stream-format = (string) raw"));
 
 static GstStaticPadTemplate video_template =
 GST_STATIC_PAD_TEMPLATE ("video_%u", GST_PAD_SINK, GST_PAD_REQUEST,
@@ -306,8 +382,14 @@ gst_moq_sink_write_object (GstMoqSink *self, GstMoqSinkPad *pad,
     return GST_FLOW_FLUSHING;
   }
   GST_OBJECT_LOCK (self);
+  gboolean flushing = pad->flushing || self->state_flushing;
   gboolean ended = pad->eos || self->eos_posted;
   GST_OBJECT_UNLOCK (self);
+  if (flushing) {
+    g_mutex_unlock (&self->send_lock);
+    moq_rcbuf_decref (payload);
+    return GST_FLOW_FLUSHING;
+  }
   if (ended) {
     g_mutex_unlock (&self->send_lock);
     moq_rcbuf_decref (payload);
@@ -404,6 +486,13 @@ gst_moq_sink_unschedule (GstMoqSink *self, GstMoqSinkPad *pad, gboolean flushing
   if (pad->clock_id)
     gst_clock_id_unschedule (pad->clock_id);
   GST_OBJECT_UNLOCK (self);
+  /* A flushing pad will not produce a track, so let the barrier re-evaluate
+   * instead of waiting out its timeout for this pad. */
+  if (flushing) {
+    g_mutex_lock (&self->track_lock);
+    g_cond_broadcast (&self->track_cond);
+    g_mutex_unlock (&self->track_lock);
+  }
 }
 
 /* Cancellation owns OBJECT_LOCK independently of sender serialization, so
@@ -423,12 +512,192 @@ gst_moq_sink_set_pad_flush (GstMoqSink *self, GstMoqSinkPad *pad, gboolean pendi
   if (self->ep)
     moq_endpoint_set_interrupted (self->ep, self->state_flushing || self->flush_count > 0);
   GST_OBJECT_UNLOCK (self);
+  g_mutex_lock (&self->track_lock);
+  g_cond_broadcast (&self->track_cond);
+  g_mutex_unlock (&self->track_lock);
 }
 
-/* -- LOC path (always pad) ----------------------------------------------- */
+/* -- LOC path (always pads) ---------------------------------------------- */
 
+/* Byte offset of the first NAL that is not an Access Unit Delimiter.
+ *
+ * h264parse emits an AUD at the head of every access unit when it outputs
+ * byte-stream/au, whatever the encoder was asked for. In LOC the object
+ * boundary already delimits the access unit, so the AUD carries nothing -- and
+ * it costs: a consumer that walks the payload as length-prefixed NAL units
+ * (the form the avc1 codec string and the avcC initData imply) reads the
+ * 4-byte start code as a length, and the AUD's own bytes as the next one, so
+ * the walk desynchronises and the keyframe fails to validate. Dropping it puts
+ * the SPS first, where every parser expects it. */
+static gsize
+loc_skip_leading_aud (const guint8 *d, gsize len)
+{
+  gsize sc = 0;
+  if (len >= 5 && d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 1)
+    sc = 4;
+  else if (len >= 4 && d[0] == 0 && d[1] == 0 && d[2] == 1)
+    sc = 3;
+  if (sc == 0 || (d[sc] & 0x1f) != 9)
+    return 0;
+  /* Skip to the next start code; without one the AU is only an AUD, so keep
+   * the buffer as it is rather than publishing an empty object. */
+  for (gsize i = sc; i + 3 < len; i++) {
+    if (d[i] == 0 && d[i + 1] == 0 &&
+        (d[i + 2] == 1 || (d[i + 2] == 0 && d[i + 3] == 1)))
+      return i;
+  }
+  return 0;
+}
+
+/* Derive the LOC audio track's catalog fields and stash them on the pad. Unlike
+ * video there is nothing to scavenge from the payload: AAC access units carry
+ * no in-band config, so everything comes from the caps (codec_data =
+ * AudioSpecificConfig), which GStreamer guarantees before the first buffer.
+ * Deriving is split from adding so the sender can be attached only once every
+ * linked pad has its track (gst_moq_sink_await_tracks). */
 static gboolean
-gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
+gst_moq_sink_prepare_loc_audio_track (GstMoqSink *self, GstMoqSinkPad *pad)
+{
+  gsize asc_len = 0;
+  const guint8 *asc = pad->codec_data
+      ? g_bytes_get_data (pad->codec_data, &asc_len) : NULL;
+  gint rate = 0, channels = 0;
+  if (!gst_moq_codec_aac_asc_params (asc, asc_len, &rate, &channels) ||
+      (pad->rate > 0 && pad->rate != rate) ||
+      (pad->channels > 0 && pad->channels != channels)) {
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+        ("LOC audio requires a two-byte AAC-LC AudioSpecificConfig with matching rate/channels"),
+        ("Explicit-frequency, HE-AAC and program-config-element forms are not supported"));
+    return FALSE;
+  }
+  pad->rate = rate;
+  pad->channels = channels;
+  gchar *codec = gst_moq_codec_string_from_aac_asc (asc, asc_len);
+  g_free (pad->pend_codec);
+  pad->pend_codec = codec;
+  g_free (pad->pend_chan);
+  pad->pend_chan = g_strdup_printf ("%d", pad->channels);
+  return TRUE;
+}
+
+static moq_bytes_t
+snapshot_span (moq_bytes_t span, GBytes **owned)
+{
+  *owned = g_bytes_new (span.data, span.len);
+  return (moq_bytes_t) { g_bytes_get_data (*owned, NULL), span.len };
+}
+
+static void
+prepared_track_free (gpointer data)
+{
+  PreparedTrack *t = data;
+  gst_object_unref (t->pad);
+  g_bytes_unref (t->name);
+  g_bytes_unref (t->codec);
+  g_bytes_unref (t->channels);
+  g_bytes_unref (t->init);
+  g_free (t);
+}
+
+static moq_result_t
+register_track (GstMoqSink *self, GstMoqSinkPad *pad,
+    const moq_media_track_cfg_t *cfg)
+{
+  if (self->preparing_tracks) {
+    PreparedTrack *t = g_new0 (PreparedTrack, 1);
+    t->pad = gst_object_ref (pad);
+    t->cfg = *cfg;
+    t->cfg.name = snapshot_span (cfg->name, &t->name);
+    t->cfg.codec = snapshot_span (cfg->codec, &t->codec);
+    t->cfg.channel_config = snapshot_span (cfg->channel_config, &t->channels);
+    t->cfg.init_data = snapshot_span (cfg->init_data, &t->init);
+    g_ptr_array_add (self->preparing_tracks, t);
+    return MOQ_OK;
+  }
+  g_mutex_lock (&self->send_lock);
+  GST_OBJECT_LOCK (self);
+  moq_result_t rc = !self->sender ? MOQ_ERR_CLOSED
+      : pad->eos || pad->flushing || self->eos_posted ? MOQ_ERR_WRONG_STATE
+      : moq_media_sender_add_track (self->sender, cfg, &pad->track);
+  GST_OBJECT_UNLOCK (self);
+  g_mutex_unlock (&self->send_lock);
+  return rc;
+}
+
+/* No element locks, waits, writes or teardown in this task. The endpoint runs
+ * posted tasks before sender hooks, so its first pump sees the whole set. */
+static moq_result_t
+start_sender_task (moq_endpoint_t *ep, moq_session_t *session,
+    uint64_t now_us, void *ctx)
+{
+  SenderStartup *task = ctx;
+  (void) now_us;
+  g_mutex_lock (&task->lock);
+  gboolean cancelled = task->cancelled || !session;
+  task->running = TRUE;
+  g_mutex_unlock (&task->lock);
+  moq_result_t rc = cancelled ? MOQ_ERR_INTERRUPTED
+      : moq_media_sender_attach (ep, &task->cfg, &task->sender);
+  for (guint i = 0; rc == MOQ_OK && i < task->tracks->len; i++) {
+    PreparedTrack *t = g_ptr_array_index (task->tracks, i);
+    rc = moq_media_sender_add_track (task->sender, &t->cfg, &t->track);
+  }
+  g_mutex_lock (&task->lock);
+  task->result = rc;
+  task->done = TRUE;
+  g_cond_broadcast (&task->cond);
+  g_mutex_unlock (&task->lock);
+  return rc;
+}
+
+/* Add the prepared LOC audio track. Caller holds track_lock and has already
+ * attached the sender. */
+static gboolean
+gst_moq_sink_add_loc_audio_track (GstMoqSink *self, GstMoqSinkPad *pad)
+{
+  gsize asc_len = 0;
+  const guint8 *asc = pad->codec_data
+      ? g_bytes_get_data (pad->codec_data, &asc_len) : NULL;
+  const gchar *codec = pad->pend_codec;
+  const gchar *chan_cfg = pad->pend_chan;
+
+  moq_media_track_cfg_t tc;
+  moq_media_track_cfg_init (&tc);
+  tc.name.data = (const uint8_t *) pad->track_name;
+  tc.name.len = strlen (pad->track_name);
+  tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+  tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+  tc.codec.data = (const uint8_t *) codec;
+  tc.codec.len = strlen (codec);
+  tc.is_live = TRUE;
+  tc.bitrate = pad->bitrate;
+  tc.samplerate = (uint32_t) pad->rate;
+  tc.channel_config.data = (const uint8_t *) chan_cfg;
+  tc.channel_config.len = strlen (chan_cfg);
+  /* The ASC is this track's decoder config, so it belongs in initData for the
+   * same reason avcC does on the video pad: a subscriber cannot configure a
+   * decoder from the access units alone. */
+  tc.init_data.data = asc;
+  tc.init_data.len = asc_len;
+
+  moq_result_t rc = register_track (self, pad, &tc);
+  if (rc != MOQ_OK) {
+    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
+        ("could not add LOC audio track \"%s\" (rc=%d)", pad->track_name,
+            (int) rc), (NULL));
+  } else {
+    GST_DEBUG_OBJECT (pad, "prepared LOC track %s codec=%s sr=%d ch=%d "
+        "initData=%" G_GSIZE_FORMAT " B", pad->track_name, codec, pad->rate,
+        pad->channels, asc_len);
+  }
+  return rc == MOQ_OK;
+}
+
+/* Derive the LOC video track's catalog fields (avcC + codec string) from the
+ * caps or the first keyframe and stash them on the pad. Split from the add for
+ * the same reason as the audio pad: see gst_moq_sink_await_tracks. */
+static gboolean
+gst_moq_sink_prepare_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
     const guint8 *au, gsize au_len)
 {
   const guint8 *sps, *pps;
@@ -436,7 +705,22 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
   GBytes *avcc = NULL;
   gchar *codec = NULL;
 
-  if (find_sps_pps (au, au_len, &sps, &sps_len, &pps, &pps_len)) {
+  /* stream-format=avc: the AVCDecoderConfigurationRecord is already in the
+   * caps, and the access units carry no in-band parameter sets to scavenge. */
+  if (pad->avc) {
+    gsize n = 0;
+    const guint8 *cd = pad->codec_data
+        ? g_bytes_get_data (pad->codec_data, &n) : NULL;
+    if (!cd || n < 4 || cd[0] != 1) {
+      GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+          ("stream-format=avc on pad %s without a usable codec_data (avcC)",
+              GST_PAD_NAME (pad)), (NULL));
+      return FALSE;
+    }
+    avcc = g_bytes_ref (pad->codec_data);
+    if (!self->codec)
+      codec = g_strdup_printf ("avc1.%02x%02x%02x", cd[1], cd[2], cd[3]);
+  } else if (find_sps_pps (au, au_len, &sps, &sps_len, &pps, &pps_len)) {
     avcc = build_avcc (sps, sps_len, pps, pps_len);
     if (!self->codec)
       codec = g_strdup_printf ("avc1.%02x%02x%02x", sps[1], sps[2], sps[3]);
@@ -446,6 +730,21 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
   }
   if (!codec)
     codec = g_strdup (self->codec ? self->codec : "avc1.42e01e");
+
+  g_free (pad->pend_codec);
+  pad->pend_codec = codec;
+  g_clear_pointer (&pad->pend_avcc, g_bytes_unref);
+  pad->pend_avcc = avcc;      /* may be NULL: no initData */
+  return TRUE;
+}
+
+/* Add the prepared LOC video track. Caller holds track_lock and has already
+ * attached the sender. */
+static gboolean
+gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad)
+{
+  GBytes *avcc = pad->pend_avcc;
+  const gchar *codec = pad->pend_codec;
 
   moq_media_track_cfg_t tc;
   moq_media_track_cfg_init (&tc);
@@ -469,58 +768,154 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad,
   if (pad->fps_n > 0 && pad->fps_d > 0)
     tc.framerate_millis = gst_util_uint64_scale_int (1000, pad->fps_n, pad->fps_d);
 
-  g_mutex_lock (&self->send_lock);
-  if (!self->sender) {
-    g_mutex_unlock (&self->send_lock);
-    g_free (codec);
-    g_clear_pointer (&avcc, g_bytes_unref);
-    return FALSE;
-  }
-  GST_OBJECT_LOCK (self);
-  moq_result_t rc = pad->eos || self->eos_posted ? MOQ_ERR_WRONG_STATE
-      : moq_media_sender_add_track (self->sender, &tc, &pad->track);
-  GST_OBJECT_UNLOCK (self);
-  g_mutex_unlock (&self->send_lock);
+  moq_result_t rc = register_track (self, pad, &tc);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not add track \"%s\" (rc=%d)", pad->track_name, (int) rc),
         (NULL));
   } else {
-    GST_INFO_OBJECT (pad, "added LOC track %s codec=%s %dx%d initData=%zu B",
+    GST_DEBUG_OBJECT (pad, "prepared LOC track %s codec=%s %dx%d initData=%zu B",
         pad->track_name, codec, pad->width, pad->height,
         (gsize) tc.init_data.len);
   }
-  g_free (codec);
-  g_clear_pointer (&avcc, g_bytes_unref);
   return rc == MOQ_OK;
+}
+
+static GstFlowReturn gst_moq_sink_add_cmaf_track (GstMoqSink *self,
+    GstMoqSinkPad *pad, GBytes *init);
+static gboolean gst_moq_sink_open_sender (GstMoqSink *self);
+
+static gboolean
+pad_cancelled (GstMoqSink *self, GstMoqSinkPad *pad)
+{
+  GST_OBJECT_LOCK (self);
+  gboolean cancelled = pad->flushing || pad->eos || !self->started;
+  GST_OBJECT_UNLOCK (self);
+  return cancelled;
+}
+
+/* TRUE when every LINKED pad has either prepared its track or dropped out
+ * (EOS/flushing means it will never deliver one), and at least one did prepare.
+ * Unlinked pads are excluded exactly as in gst_moq_sink_claim_eos: the always
+ * "sink"/"audio" pads exist even in a CMAF-only pipeline that uses only the
+ * request pads. Caller holds track_lock (taken outside OBJECT_LOCK). */
+static gboolean
+gst_moq_sink_tracks_ready (GstMoqSink *self)
+{
+  gboolean all = TRUE, any = FALSE;
+  GST_OBJECT_LOCK (self);
+  for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next) {
+    GstMoqSinkPad *p = GST_MOQ_SINK_PAD (l->data);
+    if (!gst_pad_is_linked (GST_PAD (p)))
+      continue;
+    if (p->pend_ready) {
+      any = TRUE;
+    } else if (!p->eos && !p->flushing) {
+      all = FALSE;
+    }
+  }
+  GST_OBJECT_UNLOCK (self);
+  return all && any;
+}
+
+/* Attach the sender and add every prepared track to it. Caller holds
+ * track_lock, which keeps this to one pass and keeps the add_track calls
+ * together. */
+static void
+gst_moq_sink_commit_tracks (GstMoqSink *self)
+{
+  if (self->tracks_committed || self->tracks_failed)
+    return;
+
+  self->preparing_tracks = g_ptr_array_new_with_free_func (prepared_track_free);
+
+  /* Snapshot the pad list so the walk does not hold OBJECT_LOCK across
+   * add_track (which takes send_lock). */
+  GList *pads = NULL;
+  GST_OBJECT_LOCK (self);
+  for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
+    pads = g_list_prepend (pads, gst_object_ref (l->data));
+  GST_OBJECT_UNLOCK (self);
+  pads = g_list_reverse (pads);
+
+  gboolean any = FALSE, failed = FALSE;
+  for (GList *l = pads; l && !failed; l = l->next) {
+    GstMoqSinkPad *p = GST_MOQ_SINK_PAD (l->data);
+    if (!p->pend_ready || p->track || pad_cancelled (self, p))
+      continue;
+    gboolean ok;
+    if (p->packaging == MOQ_MEDIA_PACKAGING_CMAF)
+      ok = gst_moq_sink_add_cmaf_track (self, p, p->init) == GST_FLOW_OK;
+    else if (p->media_type == MOQ_MEDIA_TYPE_AUDIO)
+      ok = gst_moq_sink_add_loc_audio_track (self, p);
+    else
+      ok = gst_moq_sink_add_loc_track (self, p);
+    if (ok)
+      any = TRUE;
+    else
+      failed = TRUE;
+  }
+  g_list_free_full (pads, gst_object_unref);
+
+  if (failed || !any || !gst_moq_sink_open_sender (self))
+    self->tracks_failed = TRUE;
+  else
+    self->tracks_committed = TRUE;
+  g_clear_pointer (&self->preparing_tracks, g_ptr_array_unref);
+  g_cond_broadcast (&self->track_cond);
+}
+
+/* Wait for all linked pads, then create one immutable track snapshot. The
+ * public endpoint task attaches/adds that snapshot in one managed turn before
+ * sender hooks run. Failure to prepare a linked stream is an error, never a
+ * successful partial catalog. Put queues on branches sharing an upstream task. */
+static gboolean
+gst_moq_sink_await_tracks (GstMoqSink *self, GstMoqSinkPad *pad)
+{
+  g_mutex_lock (&self->track_lock);
+  pad->pend_ready = TRUE;
+  g_cond_broadcast (&self->track_cond);
+
+  gint64 deadline = g_get_monotonic_time ()
+      + (gint64) self->catalog_wait_ms * G_TIME_SPAN_MILLISECOND;
+  while (!self->tracks_committed && !self->tracks_failed) {
+    if (pad_cancelled (self, pad))
+      break;
+    if (gst_moq_sink_tracks_ready (self)) {
+      gst_moq_sink_commit_tracks (self);
+      break;
+    }
+    if (pad_cancelled (self, pad))
+      break;
+    GST_DEBUG_OBJECT (self, "waiting for linked track set");
+    if (!g_cond_wait_until (&self->track_cond, &self->track_lock, deadline)) {
+      if (pad_cancelled (self, pad))
+        break;
+      self->tracks_failed = TRUE;
+      GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
+          ("linked pads did not prepare all tracks within %u ms", self->catalog_wait_ms),
+          ("Add queues before moqsink pads; every linked stream must supply its first buffer"));
+      g_cond_broadcast (&self->track_cond);
+      break;
+    }
+  }
+  if (self->tracks_committed && !pad->track && pad->pend_ready &&
+      !pad_cancelled (self, pad)) {
+    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
+        ("pad %s was not in the initial track set", GST_PAD_NAME (pad)),
+        ("Link all publishing pads before the first buffer; restart through READY to add streams"));
+  }
+
+  gboolean ok = self->tracks_committed && pad->track != NULL;
+  g_mutex_unlock (&self->track_lock);
+  return ok;
 }
 
 static GstFlowReturn
 gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
 {
-  g_mutex_lock (&self->send_lock);
-  if (!self->sender) {
-    g_mutex_unlock (&self->send_lock);
-    gst_buffer_unref (buffer);
-    return GST_FLOW_FLUSHING;
-  }
-  gboolean fatal = moq_media_sender_is_fatal (self->sender);
-  guint64 fatal_code = fatal ? moq_media_sender_fatal_code (self->sender) : 0;
-  g_mutex_unlock (&self->send_lock);
-  if (fatal) {
-    GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
-        ("media sender failed (code=%" G_GUINT64_FORMAT ")", fatal_code),
-        (NULL));
-    gst_buffer_unref (buffer);
-    return GST_FLOW_ERROR;
-  }
-
-  GstFlowReturn sr = gst_moq_sink_sync (self, pad, buffer);
-  if (sr != GST_FLOW_OK) {
-    gst_buffer_unref (buffer);
-    return sr;
-  }
-
+  /* Map before the barrier: preparing the video track needs the access unit
+   * when the caps carry no avcC (Annex B), and the barrier can block. */
   SinkFrame *f = g_new0 (SinkFrame, 1);
   f->buffer = buffer;          /* takes the chain's reference */
   if (!gst_buffer_map (f->buffer, &f->map, GST_MAP_READ)) {
@@ -530,17 +925,49 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
     return GST_FLOW_ERROR;
   }
 
-  gboolean keyframe = !GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+  gboolean audio = pad->media_type == MOQ_MEDIA_TYPE_AUDIO;
+  /* Every AAC access unit is independently decodable, so an audio object is
+   * always a sync point; video waits for a real keyframe. */
+  gboolean keyframe = audio ||
+      !GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
   if (!pad->track) {
     if (!keyframe) {
       GST_LOG_OBJECT (pad, "dropping delta frame before the first keyframe");
       sink_frame_free (f);
       return GST_FLOW_OK;
     }
-    if (!gst_moq_sink_add_loc_track (self, pad, f->map.data, f->map.size)) {
+    gboolean prepared = audio
+        ? gst_moq_sink_prepare_loc_audio_track (self, pad)
+        : gst_moq_sink_prepare_loc_track (self, pad, f->map.data, f->map.size);
+    if (!prepared) {
       sink_frame_free (f);
       return GST_FLOW_ERROR;
     }
+    /* Attaches the sender once every linked pad has a track. */
+    if (!gst_moq_sink_await_tracks (self, pad)) {
+      sink_frame_free (f);
+      return pad_cancelled (self, pad)
+          ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
+    }
+  }
+
+  g_mutex_lock (&self->send_lock);
+  gboolean fatal = !self->sender || moq_media_sender_is_fatal (self->sender);
+  guint64 fatal_code = (self->sender && fatal)
+      ? moq_media_sender_fatal_code (self->sender) : 0;
+  g_mutex_unlock (&self->send_lock);
+  if (fatal) {
+    GST_ELEMENT_ERROR (self, RESOURCE, WRITE,
+        ("media sender failed (code=%" G_GUINT64_FORMAT ")", fatal_code),
+        (NULL));
+    sink_frame_free (f);
+    return GST_FLOW_ERROR;
+  }
+
+  GstFlowReturn sr = gst_moq_sink_sync (self, pad, buffer);
+  if (sr != GST_FLOW_OK) {
+    sink_frame_free (f);
+    return sr;
   }
 
   /* Rebase to the first PTS so LOC carries small, stream-relative times. */
@@ -555,12 +982,80 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
       GST_CLOCK_TIME_IS_VALID (pad->base_pts) && dts >= pad->base_pts)
       ? (dts - pad->base_pts) / GST_USECOND : pts_us;
 
+  /* Video only: audio access units have no AUD to strip. */
+  gsize skip = (audio || pad->avc)
+      ? 0 : loc_skip_leading_aud (f->map.data, f->map.size);
   moq_rcbuf_t *payload = NULL;
-  if (moq_rcbuf_wrap (moq_alloc_default (), f->map.data, f->map.size,
-          sink_frame_release, f, &payload) != MOQ_OK) {
+  if (moq_rcbuf_wrap (moq_alloc_default (), f->map.data + skip,
+          f->map.size - skip, sink_frame_release, f, &payload) != MOQ_OK) {
     sink_frame_free (f);
     GST_ELEMENT_ERROR (self, RESOURCE, WRITE, ("rcbuf wrap failed"), (NULL));
     return GST_FLOW_ERROR;
+  }
+
+  /* LOC-01 2.3.1.1: the Capture Timestamp is wall-clock microseconds since the
+   * Unix epoch. presentation_time_us above is rebased to the start of the
+   * stream, and libmoq would emit that verbatim if has_capture_time were false,
+   * so a subscriber computing `now - capture` would see the whole epoch as
+   * latency and treat every frame as ancient. Map this buffer's PTS onto the
+   * shared anchor instead. */
+  gboolean have_capture = FALSE;
+  guint64 capture_us = 0;
+  GstClockTime running = pad->segment.format == GST_FORMAT_TIME
+      ? gst_segment_to_running_time (&pad->segment, GST_FORMAT_TIME, pts)
+      : GST_CLOCK_TIME_NONE;
+  if (GST_CLOCK_TIME_IS_VALID (running)) {
+    GST_OBJECT_LOCK (self);
+    if (!self->loc_anchored) {
+      self->loc_anchor_epoch_us = g_get_real_time ();
+      self->loc_anchor_pts = running;
+      self->loc_anchored = TRUE;
+      GST_INFO_OBJECT (pad, "LOC capture-timestamp anchor: pts %" GST_TIME_FORMAT
+          " = %" G_GINT64_FORMAT " us since the epoch",
+          GST_TIME_ARGS (pts), self->loc_anchor_epoch_us);
+    }
+    GstClockTimeDiff d = GST_CLOCK_DIFF (self->loc_anchor_pts, running);
+    gint64 c = self->loc_anchor_epoch_us + d / GST_USECOND;
+    GST_OBJECT_UNLOCK (self);
+    if (c > 0) {
+      capture_us = (guint64) c;
+      have_capture = TRUE;
+    }
+  }
+
+  gboolean starts_group = keyframe;
+  if (audio) {
+    /* Open an audio group at every VIDEO group start (keyframe), so both
+     * tracks are joinable at the same instant. A subscriber starts each track
+     * at that track's next group boundary, and the two cadences are otherwise
+     * unrelated (video = GOP, audio = a fixed period), so their join points
+     * drift against each other: measured on this pipeline, audio arrived up to
+     * a full audio-period after video, and a player that cannot start video
+     * before it has an audio reference then renders nothing at all. Aligning
+     * collapses that gap to network jitter.
+     *
+     * loc-audio-group-ms stays as an UPPER bound so audio still opens groups
+     * when video stalls or is absent (audio-only). An extra boundary between
+     * keyframes is harmless here: it only makes audio available EARLIER, which
+     * is the safe direction. */
+    GST_OBJECT_LOCK (self);
+    GstClockTime vgrp = self->loc_video_group_pts;
+    GST_OBJECT_UNLOCK (self);
+
+    if (GST_CLOCK_TIME_IS_VALID (vgrp) && vgrp != pad->aligned_to_video_pts) {
+      pad->aligned_to_video_pts = vgrp;   /* one audio group per video group */
+      pad->group_start = pts_us;
+    } else if (!GST_CLOCK_TIME_IS_VALID (pad->group_start) ||
+               pts_us >= pad->group_start + (guint64) self->loc_audio_group_ms * 1000) {
+      pad->group_start = pts_us;
+    } else {
+      starts_group = FALSE;
+    }
+  } else if (starts_group && GST_CLOCK_TIME_IS_VALID (pts)) {
+    /* Publish this video group start for the audio pad to align to. */
+    GST_OBJECT_LOCK (self);
+    self->loc_video_group_pts = pts;
+    GST_OBJECT_UNLOCK (self);
   }
 
   moq_media_send_object_t o;
@@ -568,11 +1063,13 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
   o.struct_size = sizeof o;
   o.payload = payload;
   o.is_sync = keyframe;
-  o.starts_group = keyframe;
+  o.starts_group = starts_group;
   o.decode_time_us = dts_us;
   o.presentation_time_us = pts_us;
+  o.has_capture_time = have_capture;
+  o.capture_time_us = capture_us;
 
-  return gst_moq_sink_write_object (self, pad, payload, &o, f->map.size);
+  return gst_moq_sink_write_object (self, pad, payload, &o, f->map.size - skip);
 }
 
 /* -- CMAF path (request pads) ------------------------------------------- */
@@ -644,28 +1141,18 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
     tc.channel_config.len = strlen (channels);
   }
 
-  g_mutex_lock (&self->send_lock);
-  if (!self->sender) {
-    g_mutex_unlock (&self->send_lock);
-    g_free (codec);
-    return GST_FLOW_FLUSHING;
-  }
-  GST_OBJECT_LOCK (self);
-  rc = pad->eos || self->eos_posted ? MOQ_ERR_WRONG_STATE
-      : moq_media_sender_add_track (self->sender, &tc, &pad->track);
-  GST_OBJECT_UNLOCK (self);
-  g_mutex_unlock (&self->send_lock);
+  rc = register_track (self, pad, &tc);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("could not add CMAF track \"%s\" codec=%s (rc=%d)",
             pad->track_name, codec, (int) rc), (NULL));
   } else if (pad->media_type == MOQ_MEDIA_TYPE_VIDEO) {
-    GST_INFO_OBJECT (pad, "added CMAF track %s codec=%s %ux%u timescale=%u "
+    GST_DEBUG_OBJECT (pad, "prepared CMAF track %s codec=%s %ux%u timescale=%u "
         "init=%" G_GSIZE_FORMAT " B", pad->track_name, codec,
         pad->init_info.width, pad->init_info.height,
         pad->init_info.timescale, init_len);
   } else {
-    GST_INFO_OBJECT (pad, "added CMAF track %s codec=%s sr=%u ch=%s "
+    GST_DEBUG_OBJECT (pad, "prepared CMAF track %s codec=%s sr=%u ch=%s "
         "timescale=%u init=%" G_GSIZE_FORMAT " B", pad->track_name, codec,
         pad->init_info.samplerate, channels, pad->init_info.timescale,
         init_len);
@@ -739,13 +1226,10 @@ gst_moq_sink_send_fragment (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *frag)
 static GstFlowReturn
 gst_moq_sink_chain_cmaf (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
 {
+  /* The sender is attached by the track barrier below, not by _start, so a
+   * NULL sender here just means no pad has produced a track yet. */
   g_mutex_lock (&self->send_lock);
-  if (!self->sender) {
-    g_mutex_unlock (&self->send_lock);
-    gst_buffer_unref (buffer);
-    return GST_FLOW_FLUSHING;
-  }
-  gboolean fatal = moq_media_sender_is_fatal (self->sender);
+  gboolean fatal = self->sender && moq_media_sender_is_fatal (self->sender);
   guint64 fatal_code = fatal ? moq_media_sender_fatal_code (self->sender) : 0;
   g_mutex_unlock (&self->send_lock);
   if (fatal) {
@@ -791,7 +1275,11 @@ gst_moq_sink_chain_cmaf (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer
       } else {
         g_clear_pointer (&pad->init, g_bytes_unref);
         pad->init = g_bytes_ref (u->data);
-        ret = gst_moq_sink_add_cmaf_track (self, pad, pad->init);
+        /* Attaches the sender once every linked pad has its init segment, so
+         * the initial catalog carries them all (gst_moq_sink_await_tracks). */
+        if (!gst_moq_sink_await_tracks (self, pad))
+          ret = (pad->flushing || !self->started)
+              ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
       }
     } else {
       if (!pad->track) {
@@ -819,7 +1307,7 @@ gst_moq_sink_chain (GstPad *gpad, GstObject *parent, GstBuffer *buffer)
   GstMoqSink *self = GST_MOQ_SINK (parent);
   GstMoqSinkPad *pad = GST_MOQ_SINK_PAD (gpad);
 
-  if (!self->started || !self->sender) {
+  if (!self->started) {
     gst_buffer_unref (buffer);
     return GST_FLOW_FLUSHING;
   }
@@ -910,13 +1398,15 @@ gst_moq_sink_retry_ends (GstMoqSink *self)
     gst_moq_sink_eos_error (self, rc);
 }
 
-/* The claim closes writer/add gates. No endpoint tasks are posted by this
- * plugin, so no unexecuted task can create output after this barrier. */
+/* The claim closes writer/add gates. The startup task has settled before
+ * a sender is published to writers, so no pending task can create output here. */
 static gboolean
 gst_moq_sink_drain (GstMoqSink *self, gint64 deadline)
 {
   g_mutex_lock (&self->send_lock);
-  moq_result_t rc = self->sender && self->ep && !self->eos_failed ? MOQ_OK : MOQ_ERR_CLOSED;
+  moq_result_t rc = !self->eos_failed &&
+      ((self->sender && self->ep) || (!self->sender && !self->ep && !self->end_requests))
+      ? MOQ_OK : MOQ_ERR_CLOSED;
   for (GList *l = self->end_requests; l && rc == MOQ_OK; l = l->next) {
     EndRequest *r = l->data;
     if (!r->accepted) {
@@ -924,7 +1414,7 @@ gst_moq_sink_drain (GstMoqSink *self, gint64 deadline)
       r->accepted = rc == MOQ_OK;
     }
   }
-  if (rc == MOQ_OK)
+  if (rc == MOQ_OK && self->ep)
     rc = gst_moq_eos_drain (self->ep, deadline);
   g_mutex_unlock (&self->send_lock);
   if (rc != MOQ_OK) {
@@ -992,6 +1482,49 @@ gst_moq_sink_event (GstPad *gpad, GstObject *parent, GstEvent *event)
       gst_structure_get_int (st, "width", &pad->width);
       gst_structure_get_int (st, "height", &pad->height);
       gst_structure_get_fraction (st, "framerate", &pad->fps_n, &pad->fps_d);
+      if (pad->media_type == MOQ_MEDIA_TYPE_VIDEO &&
+          pad->packaging == MOQ_MEDIA_PACKAGING_RAW) {
+        const gchar *sf = gst_structure_get_string (st, "stream-format");
+        pad->avc = sf && !strcmp (sf, "avc");
+        g_clear_pointer (&pad->codec_data, g_bytes_unref);
+        const GValue *cd = gst_structure_get_value (st, "codec_data");
+        if (pad->avc && cd && GST_VALUE_HOLDS_BUFFER (cd)) {
+          GstBuffer *cdbuf = gst_value_get_buffer (cd);
+          GstMapInfo m;
+          if (gst_buffer_map (cdbuf, &m, GST_MAP_READ)) {
+            pad->codec_data = g_bytes_new (m.data, m.size);
+            gst_buffer_unmap (cdbuf, &m);
+          }
+        }
+      }
+      if (pad->media_type == MOQ_MEDIA_TYPE_AUDIO &&
+          pad->packaging == MOQ_MEDIA_PACKAGING_RAW) {
+        pad->rate = pad->channels = 0;
+        gst_structure_get_int (st, "rate", &pad->rate);
+        gst_structure_get_int (st, "channels", &pad->channels);
+        g_clear_pointer (&pad->codec_data, g_bytes_unref);
+        const GValue *cd = gst_structure_get_value (st, "codec_data");
+        if (cd && GST_VALUE_HOLDS_BUFFER (cd)) {
+          GstBuffer *cdbuf = gst_value_get_buffer (cd);
+          GstMapInfo m;
+          if (gst_buffer_map (cdbuf, &m, GST_MAP_READ)) {
+            pad->codec_data = g_bytes_new (m.data, m.size);
+            gst_buffer_unmap (cdbuf, &m);
+          }
+        }
+        /* The catalog's samplerate/channelConfig are REQUIRED for an audio
+         * track (MSF-01 5.2.28/5.2.29) and libmoq rejects the track without
+         * them, so fall back to the ASC when the caps omit either. */
+        if ((pad->rate == 0 || pad->channels == 0) && pad->codec_data) {
+          gsize n;
+          const guint8 *asc = g_bytes_get_data (pad->codec_data, &n);
+          gint r = 0, c = 0;
+          if (gst_moq_codec_aac_asc_params (asc, n, &r, &c)) {
+            if (pad->rate == 0) pad->rate = r;
+            if (pad->channels == 0) pad->channels = c;
+          }
+        }
+      }
       GST_DEBUG_OBJECT (pad, "caps %" GST_PTR_FORMAT, caps);
       break;
     }
@@ -1027,6 +1560,11 @@ gst_moq_sink_event (GstPad *gpad, GstObject *parent, GstEvent *event)
       GST_OBJECT_LOCK (self);
       pad->eos = TRUE;
       GST_OBJECT_UNLOCK (self);
+      /* Drops this pad out of the track barrier (a stream that ends without
+       * ever delivering a keyframe must not hold the others up). */
+      g_mutex_lock (&self->track_lock);
+      g_cond_broadcast (&self->track_cond);
+      g_mutex_unlock (&self->track_lock);
       moq_result_t rc = gst_moq_sink_end_track (self, pad, deadline);
       if (rc != MOQ_OK) {
         gst_moq_sink_eos_error (self, rc);
@@ -1161,6 +1699,8 @@ gst_moq_sink_start (GstMoqSink *self)
 
   self->eos_posted = FALSE;
   self->eos_failed = FALSE;
+  self->loc_anchored = FALSE;
+  self->loc_video_group_pts = GST_CLOCK_TIME_NONE;
   GST_OBJECT_LOCK (self);
   self->flush_count = 0;
   self->state_flushing = FALSE;
@@ -1168,6 +1708,26 @@ gst_moq_sink_start (GstMoqSink *self)
     gst_moq_sink_pad_reset (GST_MOQ_SINK_PAD (l->data));
   GST_OBJECT_UNLOCK (self);
 
+  g_mutex_lock (&self->track_lock);
+  self->tracks_committed = FALSE;
+  self->tracks_failed = FALSE;
+  g_mutex_unlock (&self->track_lock);
+
+  self->started = TRUE;
+  GST_INFO_OBJECT (self, "ready: ns=%s, relay %s:%u%s (connecting once every "
+      "linked pad has a track)", self->namespace_str, self->host, self->port,
+      self->relay_path);
+  return TRUE;
+}
+
+/* Connect the endpoint and attach the media sender. Deferred out of _start so
+ * prepared tracks can be attached/added in one posted task before the first
+ * sender hook; see gst_moq_sink_await_tracks. A relay that
+ * is down is therefore reported on the first buffer rather than on the state
+ * change. Caller holds track_lock. */
+static gboolean
+gst_moq_sink_open_sender (GstMoqSink *self)
+{
   gchar *url = g_strdup_printf ("https://%s:%u%s", self->host, self->port,
       self->relay_path);
 
@@ -1202,16 +1762,79 @@ gst_moq_sink_start (GstMoqSink *self)
   diagnostic->namespace_str = g_strdup (self->namespace_str);
   sc.callbacks.ctx = diagnostic;
   sc.callbacks.on_ready = gst_moq_sink_on_ready;
+  /* Push (contribution) mode: PUBLISH every track and write the catalog live so
+   * a relay that expects a publisher-initiated PUBLISH picks the stream up.
+   * Off by default -- announce-and-wait is what red5-moq-relay serves today. */
+  sc.publish_tracks = self->publish_tracks;
+  /* Republish the catalog on a timer only when explicitly requested for
+   * relay cache compatibility. Initial catalog completeness is provided by
+   * the atomic startup task, not by periodic publication.
+   *
+   * Set it only for a relay that does not pull that retained group on a late
+   * subscriber's behalf. MoQT permits a relay to answer a FETCH from its own
+   * cache alone and to be "catalog-blind", and libmoq documents the retained
+   * group as "NOT a relay-safe catalog solution" for exactly that reason, so
+   * such a relay delivers no catalog at all to a late joiner -- red5-moq-relay
+   * 1.6.40/1.7.8 answer the joining FETCH with REQUEST_ERROR 17. The periodic
+   * republish sidesteps it by making the catalog ordinary live content, which
+   * any relay forwards. */
+  sc.catalog_refresh_interval_us =
+      self->catalog_refresh_ms ? (guint64) self->catalog_refresh_ms * 1000 : 0;
   sc.endpoint = NULL;
   sc.namespace_.parts = self->ns_bytes;
   sc.namespace_.count = self->ns_count;
 
-  moq_media_sender_t *sender = NULL;
-  rc = moq_media_sender_attach (ep, &sc, &sender);
+  SenderStartup task = { 0 };
+  g_mutex_init (&task.lock);
+  g_cond_init (&task.cond);
+  task.cfg = sc;
+  task.tracks = self->preparing_tracks;
+  rc = moq_endpoint_post (ep, start_sender_task, &task);
+  gboolean timed_out = FALSE;
+  if (rc == MOQ_OK) {
+    gint64 deadline = g_get_monotonic_time () + EOS_DRAIN_TIMEOUT_US;
+    g_mutex_lock (&task.lock);
+    while (!task.done) {
+      GST_OBJECT_LOCK (self);
+      gboolean cancelled = self->state_flushing || self->flush_count > 0;
+      GST_OBJECT_UNLOCK (self);
+      if (cancelled || g_get_monotonic_time () >= deadline) {
+        timed_out = !cancelled;
+        task.cancelled = TRUE;
+        /* A running task only performs finite attach/add calls. Settle it
+         * before app-thread destruction; an unstarted task runs closed in stop. */
+        while (task.running && !task.done)
+          g_cond_wait (&task.cond, &task.lock);
+        break;
+      }
+      g_cond_wait_until (&task.cond, &task.lock,
+          MIN (deadline, g_get_monotonic_time () + 5000));
+    }
+    rc = task.cancelled ? (timed_out ? MOQ_DONE : MOQ_ERR_INTERRUPTED) : task.result;
+    g_mutex_unlock (&task.lock);
+  }
+  moq_media_sender_t *sender = task.sender;
+  if (rc != MOQ_OK) {
+    if (sender)
+      moq_media_sender_destroy (sender);
+    /* Completes a queued callback with session==NULL before its ctx expires. */
+    moq_endpoint_stop (ep);
+    moq_endpoint_destroy (ep);
+  } else {
+    for (guint i = 0; i < task.tracks->len; i++) {
+      PreparedTrack *t = g_ptr_array_index (task.tracks, i);
+      GST_OBJECT_LOCK (self);
+      t->pad->track = t->track;
+      GST_OBJECT_UNLOCK (self);
+    }
+  }
+  g_cond_clear (&task.cond);
+  g_mutex_clear (&task.lock);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
-        ("could not attach media sender (rc=%d)", (int) rc), (NULL));
-    goto fail_ep;
+        ("could not prepare MoQ sender (rc=%d)", (int) rc), (NULL));
+    gst_moq_sink_ready_diagnostic_free (diagnostic);
+    goto fail_ns;
   }
   g_mutex_lock (&self->send_lock);
   self->sender = sender;
@@ -1223,15 +1846,10 @@ gst_moq_sink_start (GstMoqSink *self)
   GST_OBJECT_UNLOCK (self);
   g_mutex_unlock (&self->send_lock);
 
-  self->started = TRUE;
   GST_INFO_OBJECT (self, "started: publishing ns=%s via relay %s:%u%s",
       self->namespace_str, self->host, self->port, self->relay_path);
   return TRUE;
 
-fail_ep:
-  moq_endpoint_stop (ep);
-  moq_endpoint_destroy (ep);
-  gst_moq_sink_ready_diagnostic_free (diagnostic);
 fail_ns:
   g_clear_pointer (&self->ns_tokens, g_strfreev);
   g_clear_pointer (&self->ns_bytes, g_free);
@@ -1317,6 +1935,12 @@ gst_moq_sink_change_state (GstElement *element, GstStateChange transition)
       if (self->ep)
         moq_endpoint_set_interrupted (self->ep, TRUE);
       GST_OBJECT_UNLOCK (self);
+      /* Release any pad parked in the track barrier: going to READY must not
+       * leave a streaming thread waiting for a track that will never arrive.
+       * track_lock is taken OUTSIDE OBJECT_LOCK, so this follows the unlock. */
+      g_mutex_lock (&self->track_lock);
+      g_cond_broadcast (&self->track_cond);
+      g_mutex_unlock (&self->track_lock);
       break;
     default:
       break;
@@ -1395,6 +2019,18 @@ gst_moq_sink_set_property (GObject *object, guint prop_id,
     case PROP_SAP_TIMELINE:
       self->sap_timeline = g_value_get_boolean (value);
       break;
+    case PROP_PUBLISH_TRACKS:
+      self->publish_tracks = g_value_get_boolean (value);
+      break;
+    case PROP_CATALOG_REFRESH_MS:
+      self->catalog_refresh_ms = g_value_get_uint (value);
+      break;
+    case PROP_CATALOG_WAIT_MS:
+      self->catalog_wait_ms = g_value_get_uint (value);
+      break;
+    case PROP_LOC_AUDIO_GROUP_MS:
+      self->loc_audio_group_ms = g_value_get_uint (value);
+      break;
     case PROP_MAX_FRAGMENT_SIZE:
       self->max_fragment_size = g_value_get_uint64 (value);
       break;
@@ -1442,6 +2078,18 @@ gst_moq_sink_get_property (GObject *object, guint prop_id,
     case PROP_SAP_TIMELINE:
       g_value_set_boolean (value, self->sap_timeline);
       break;
+    case PROP_PUBLISH_TRACKS:
+      g_value_set_boolean (value, self->publish_tracks);
+      break;
+    case PROP_CATALOG_REFRESH_MS:
+      g_value_set_uint (value, self->catalog_refresh_ms);
+      break;
+    case PROP_CATALOG_WAIT_MS:
+      g_value_set_uint (value, self->catalog_wait_ms);
+      break;
+    case PROP_LOC_AUDIO_GROUP_MS:
+      g_value_set_uint (value, self->loc_audio_group_ms);
+      break;
     case PROP_MAX_FRAGMENT_SIZE:
       g_value_set_uint64 (value, self->max_fragment_size);
       break;
@@ -1459,6 +2107,8 @@ gst_moq_sink_finalize (GObject *object)
   g_free (self->namespace_str);
   g_free (self->codec);
   g_mutex_clear (&self->send_lock);
+  g_mutex_clear (&self->track_lock);
+  g_cond_clear (&self->track_cond);
   G_OBJECT_CLASS (gst_moq_sink_parent_class)->finalize (object);
 }
 
@@ -1519,6 +2169,37 @@ gst_moq_sink_class_init (GstMoqSinkClass *klass)
       g_param_spec_boolean ("sap-timeline", "SAP timeline",
           "Publish a CMSF SAP event timeline track for every CMAF track",
           FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_PUBLISH_TRACKS,
+      g_param_spec_boolean ("publish-tracks", "Publish tracks",
+          "Push mode: PUBLISH each track and write the catalog without waiting "
+          "for a subscriber. Off means announce and wait for demand.", FALSE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_CATALOG_REFRESH_MS,
+      g_param_spec_uint ("catalog-refresh-ms", "Catalog refresh interval",
+          "Republish the catalog every N ms. 0 disables it, which is what "
+          "MSF-01 5 asks for (republish on track-availability change): the "
+          "element already holds the initial catalog until every linked pad "
+          "has a track. Needed only for a relay that cannot serve the joining "
+          "FETCH that fetches the retained catalog (red5-moq-relay 1.6.40 and "
+          "1.7.8): there, keep it under their ~2000 ms park window.",
+          0, G_MAXUINT, 0,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_CATALOG_WAIT_MS,
+      g_param_spec_uint ("catalog-wait-ms", "Initial catalog wait",
+          "How long the first pad to produce a track waits for the remaining "
+          "linked pads before reporting an error without opening a connection. Bounds a "
+          "linked pad that never delivers; a pad that reaches EOS or flushes "
+          "drops out at once.",
+          0, G_MAXUINT, DEFAULT_CATALOG_WAIT_MS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_LOC_AUDIO_GROUP_MS,
+      g_param_spec_uint ("loc-audio-group-ms", "LOC audio group length",
+          "How often the LOC audio track opens a new group (ms). A subscriber "
+          "joins each track at its next group boundary, so this together with "
+          "the video GOP decides which track's first object reaches a new "
+          "subscriber first.",
+          1, G_MAXUINT, LOC_AUDIO_GROUP_US / 1000,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_MAX_FRAGMENT_SIZE,
       g_param_spec_uint64 ("max-fragment-size", "Max fragment size",
           "Largest single ISO BMFF box accepted on a CMAF pad (bytes)",
@@ -1527,6 +2208,8 @@ gst_moq_sink_class_init (GstMoqSinkClass *klass)
 
   gst_element_class_add_static_pad_template_with_gtype (element_class,
       &sink_template, GST_TYPE_MOQ_SINK_PAD);
+  gst_element_class_add_static_pad_template_with_gtype (element_class,
+      &audio_loc_template, GST_TYPE_MOQ_SINK_PAD);
   gst_element_class_add_static_pad_template_with_gtype (element_class,
       &video_template, GST_TYPE_MOQ_SINK_PAD);
   gst_element_class_add_static_pad_template_with_gtype (element_class,
@@ -1553,8 +2236,15 @@ gst_moq_sink_init (GstMoqSink *self)
   self->draft = DEFAULT_DRAFT;
   self->sync = TRUE;
   self->max_fragment_size = DEFAULT_MAX_FRAGMENT;
+  self->publish_tracks = FALSE;
+  self->catalog_refresh_ms = 0;
+  self->catalog_wait_ms = DEFAULT_CATALOG_WAIT_MS;
+  self->loc_audio_group_ms = LOC_AUDIO_GROUP_US / 1000;
+  self->loc_video_group_pts = GST_CLOCK_TIME_NONE;
   self->latency = 0;
   g_mutex_init (&self->send_lock);
+  g_mutex_init (&self->track_lock);
+  g_cond_init (&self->track_cond);
 
   GstPadTemplate *templ = gst_static_pad_template_get (&sink_template);
   self->locpad = gst_moq_sink_pad_new (templ, "sink", MOQ_MEDIA_TYPE_VIDEO,
@@ -1564,6 +2254,15 @@ gst_moq_sink_init (GstMoqSink *self)
   gst_pad_set_chain_function (GST_PAD (self->locpad), gst_moq_sink_chain);
   gst_pad_set_event_function (GST_PAD (self->locpad), gst_moq_sink_event);
   gst_element_add_pad (GST_ELEMENT (self), GST_PAD (self->locpad));
+
+  templ = gst_static_pad_template_get (&audio_loc_template);
+  self->locpad_audio = gst_moq_sink_pad_new (templ, "audio",
+      MOQ_MEDIA_TYPE_AUDIO, MOQ_MEDIA_PACKAGING_RAW, DEFAULT_AUDIO_TRACK_NAME,
+      DEFAULT_AUDIO_BITRATE, DEFAULT_MAX_FRAGMENT);
+  gst_object_unref (templ);
+  gst_pad_set_chain_function (GST_PAD (self->locpad_audio), gst_moq_sink_chain);
+  gst_pad_set_event_function (GST_PAD (self->locpad_audio), gst_moq_sink_event);
+  gst_element_add_pad (GST_ELEMENT (self), GST_PAD (self->locpad_audio));
 
   GST_OBJECT_FLAG_SET (self, GST_ELEMENT_FLAG_SINK);
 }

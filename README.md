@@ -70,10 +70,12 @@ negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
 `sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout`,
 `latency` (ms reported through the LATENCY query so synced sinks absorb
 network jitter instead of dropping late frames; default 200) and `caps`,
-which is optional for CMAF and H.264 LOC — it is derived from the catalog
+which is optional for CMAF, AAC-LC LOC and H.264 LOC — it is derived from the catalog
 when omitted. Automatic H.264 LOC caps describe Annex B access units;
 length-prefixed payloads and catalog-only decoder configuration are not yet
-handled automatically. Other LOC codecs require explicit compatible caps.
+handled automatically; for length-prefixed AVC, supply explicit `video/x-h264,
+stream-format=avc,alignment=au` caps including the matching `codec_data`.
+Other LOC codecs require explicit compatible caps.
 
 `moqsink` is a plain `GstElement`, not a `GstBaseSink`: it does not preroll,
 so `READY` to `PAUSED` returns immediately instead of waiting for the first
@@ -91,6 +93,38 @@ Keep `draft` the same on the publisher and on every subscriber. Relays that
 bridge draft-16 and draft-18 sessions have been seen to forward the LOC
 property block verbatim, and the two drafts encode its integers differently
 (QUIC varint vs vi64), so a cross-draft subscriber rejects the objects.
+
+### LOC with audio
+
+The always pads are `sink` (H.264 byte-stream) and `audio` (raw AAC access
+units). Each publishes a LOC-01 track into the same catalog, so a LOC broadcast
+can carry video and audio:
+
+```sh
+gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace=example \
+  videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse config-interval=-1 \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! ms.sink \
+  audiotestsrc is-live=true ! voaacenc ! aacparse \
+    ! audio/mpeg,mpegversion=4,stream-format=raw ! ms.audio
+```
+
+The audio pad wants **raw** AAC, not ADTS: the decoder config travels in the
+catalog's `initData`, taken from the caps' `codec_data`, exactly as the video
+pad publishes avcC there. `rate` and `channels` become the catalog's
+`samplerate` and `channelConfig`, which MSF-01 §5.2.28/§5.2.29 make mandatory
+for an audio track — the element reads them from the caps and falls back to the
+AudioSpecificConfig. Every AAC frame is a sync point, so objects are never
+dropped waiting for a keyframe; groups are cut on a one-second budget rather
+than one per frame, matching the video GOP cadence. The element's `track-name`
+and `bitrate` properties apply to the video pad; the audio pad carries its own
+(`ms.audio::track-name=...`), defaulting to `audio`.
+
+Play it back with `moqsrc`, which derives AAC caps from the catalog:
+
+```sh
+gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=audio \
+  ! aacparse ! avdec_aac ! autoaudiosink
+```
 
 ### CMAF (fragmented MP4) with audio
 
@@ -124,14 +158,17 @@ gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example tra
 
 ## Status
 
-The plugin supports H.264 Annex B LOC publishing and CMAF video/audio under a
-CMSF-01 catalog. CMAF codec strings cover AVC, AAC and Opus; automatic LOC
-receiver caps cover H.264 only. Finite draft-16 LOC plus CMAF/AAC delivery,
-independent track EOS and publisher drain passed through the Chicago and London
-moqx relays with the exact private SDK described below. Separately captured
-CMAF AVC/AAC from Playa decoded offline. These results do not qualify arbitrary
-LOC framing, Opus playback, draft-18 finite EOS or every relay implementation.
-A raw-QUIC (`moqt://`) transport option is a follow-up.
+The plugin supports H.264 Annex B LOC publishing, LOC AAC audio on a second
+always pad, and CMAF video/audio under a CMSF-01 catalog. CMAF codec strings
+cover AVC, AAC and Opus; automatic LOC receiver caps cover H.264 and AAC.
+Finite draft-16 LOC plus CMAF/AAC delivery, independent track EOS and publisher
+drain passed through the Chicago and London moqx relays with the exact private
+SDK described below. Separately captured CMAF AVC/AAC from Playa decoded
+offline. LOC video-plus-audio publishing, and `moqsrc` decoding the audio track
+back, were validated against `moq-relay.red5.net` on draft-16 only. These
+results do not qualify arbitrary LOC framing, Opus playback, draft-18 finite
+EOS or every relay implementation. A raw-QUIC (`moqt://`) transport option is a
+follow-up.
 
 ## Author
 
@@ -164,3 +201,23 @@ released MOQ5 package; older transport-only drain implementations are insufficie
 Consumers must supply a MOQ5 SDK with these service-drain guarantees; a public
 minimum revision has not yet been established. Relay catalog bootstrap support
 is a separate requirement for playback against a given relay.
+
+
+LOC audio publishing accepts AAC-LC with a supported two-byte
+AudioSpecificConfig, an indexed sample rate and an explicit channel configuration.
+The config must agree with any rate/channels in caps. HE-AAC, explicit-frequency
+core dependencies, extension/trailing config and program-config-element forms are rejected rather than guessed. This
+restriction applies to LOC publishing, not the existing CMAF codec-string support.
+
+Publishing connects after every linked pad has prepared its first track. Put
+queues before pads fed by a common upstream streaming task. `catalog-wait-ms`
+(default 3000) bounds that wait: an incomplete track set reports an error and
+opens no connection. Initial attach/add runs in one MOQ5 endpoint task before
+the first sender pump, so it cannot publish a partial initial catalog. Link all
+publishing pads before the first buffer; restart through READY to change the
+initial stream set. Empty streams finish without opening a connection.
+`catalog-refresh-ms` defaults to zero; opt into refresh only for relay cache
+compatibility. Capture timestamps use each pad's segment running time so encoder
+PTS offsets do not shift audio against video. Audio group boundaries follow
+observed video keyframe boundaries, with `loc-audio-group-ms` as an upper bound;
+this does not guarantee simultaneous delivery by the relay.

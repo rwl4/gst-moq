@@ -403,6 +403,47 @@ test_startup_terminal (gconstpointer scenario)
   startup_active = FALSE;
 }
 
+static void test_loc_aac_caps (gconstpointer explicit_caps)
+{
+  GstMoqSrc *src = make_source ();
+  gst_caps_replace (&src->caps, NULL);
+  if (GPOINTER_TO_INT (explicit_caps))
+    src->caps = gst_caps_from_string ("audio/mpeg,mpegversion=4,stream-format=raw");
+  static const guint8 asc[] = {0x11, 0x90};
+  moq_media_track_desc_t d = {0};
+  d.name = (moq_bytes_t) {(const guint8 *) "video", 5};
+  d.codec = (moq_bytes_t) {(const guint8 *) "mp4a.40.2", 9};
+  d.info.packaging = MOQ_MEDIA_PACKAGING_RAW;
+  d.has_samplerate = TRUE; d.samplerate = 48000;
+  d.channel_config = (moq_bytes_t) {(const guint8 *) "2", 1};
+  d.init_data = (moq_bytes_t) {asc, sizeof asc};
+  receiver.events[0].kind = MOQ_MEDIA_TRACK_ADDED;
+  receiver.events[0].track = (moq_media_track_t *) &video_handle;
+  receiver.events[0].desc = &d;
+  receiver.event_count = 1;
+  gst_moq_src_drain_track_events (src);
+  g_assert_cmpuint (src->want_init.len, ==, 0);
+  if (GPOINTER_TO_INT (explicit_caps)) {
+    g_assert_null (src->derived_caps);
+    src->receiver = NULL; gst_object_unref (src); return;
+  }
+  g_assert_nonnull (src->derived_caps);
+  GstStructure *st = gst_caps_get_structure (src->derived_caps, 0);
+  gint version = 0, rate = 0, channels = 0;
+  g_assert_true (gst_structure_get_int (st, "mpegversion", &version));
+  g_assert_cmpint (version, ==, 4);
+  g_assert_false (gst_structure_has_field (st, "mpeg-version"));
+  g_assert_true (gst_structure_get_int (st, "rate", &rate));
+  g_assert_true (gst_structure_get_int (st, "channels", &channels));
+  g_assert_cmpint (rate, ==, 48000); g_assert_cmpint (channels, ==, 2);
+  const GValue *v = gst_structure_get_value (st, "codec_data");
+  GstBuffer *cd = gst_value_get_buffer (v);
+  guint8 bytes[2]; g_assert_cmpuint (gst_buffer_extract (cd, 0, bytes, 2), ==, 2);
+  g_assert_cmpmem (bytes, 2, asc, 2);
+  g_assert_cmpuint (src->want_init.len, ==, 0);
+  src->receiver = NULL; gst_object_unref (src);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -422,5 +463,7 @@ main (int argc, char **argv)
   g_test_add_data_func ("/src/startup-terminal-known", GUINT_TO_POINTER (0), test_startup_terminal);
   g_test_add_data_func ("/src/startup-terminal-getter-failure", GUINT_TO_POINTER (1), test_startup_terminal);
   g_test_add_data_func ("/src/startup-terminal-none", GUINT_TO_POINTER (2), test_startup_terminal);
+  g_test_add_data_func ("/src/loc-aac-caps", GINT_TO_POINTER (0), test_loc_aac_caps);
+  g_test_add_data_func ("/src/loc-aac-explicit-caps", GINT_TO_POINTER (1), test_loc_aac_caps);
   return g_test_run ();
 }

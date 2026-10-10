@@ -422,6 +422,9 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
           self->track_ever_seen = TRUE;
           self->want_init = d->init_data;
           self->init_pushed = FALSE;
+          if (d->info.packaging == MOQ_MEDIA_PACKAGING_RAW &&
+              d->codec.len >= 4 && memcmp (d->codec.data, "mp4a", 4) == 0)
+            self->want_init = (moq_bytes_t) { NULL, 0 };
           if (!self->caps || gst_caps_is_any (self->caps)) {
             GstCaps *c = NULL;
             if (d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF) {
@@ -433,6 +436,39 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
               c = gst_caps_new_simple ("video/x-h264",
                   "stream-format", G_TYPE_STRING, "byte-stream",
                   "alignment", G_TYPE_STRING, "au", NULL);
+            } else if (d->codec.len >= 4 &&
+                memcmp (d->codec.data, "mp4a", 4) == 0) {
+              /* LOC audio: raw AAC access units. The decoder config travels in
+               * the catalog, so it becomes codec_data rather than a pushed init
+               * segment -- unlike CMAF, where qtdemux reads it from the moov. */
+              c = gst_caps_new_simple ("audio/mpeg",
+                  "mpegversion", G_TYPE_INT, 4,
+                  "stream-format", G_TYPE_STRING, "raw", NULL);
+              if (d->has_samplerate && d->samplerate)
+                gst_caps_set_simple (c, "rate", G_TYPE_INT,
+                    (gint) d->samplerate, NULL);
+              /* channelConfig is a catalog span, not a C string, so it is
+               * parsed bounded rather than with atoi(). */
+              gint ch = 0;
+              for (gsize i = 0; i < d->channel_config.len && ch < 256; i++) {
+                guint8 ci = d->channel_config.data[i];
+                if (ci < '0' || ci > '9') { ch = 0; break; }
+                ch = ch * 10 + (ci - '0');
+              }
+              if (ch > 0)
+                gst_caps_set_simple (c, "channels", G_TYPE_INT, ch, NULL);
+              /* Prefer the parsed decoder extradata; fall back to the raw
+               * initData the publisher sent (they are the same ASC here). */
+              moq_bytes_t asc = d->init.codec_config.len
+                  ? d->init.codec_config : d->init_data;
+              if (asc.len && asc.data) {
+                GstBuffer *cd = gst_buffer_new_memdup (asc.data, asc.len);
+                gst_caps_set_simple (c, "codec_data", GST_TYPE_BUFFER, cd, NULL);
+                gst_buffer_unref (cd);
+              }
+              /* The catalog init is the codec_data above, not a media object:
+               * pushing it downstream would look like an AAC frame. */
+              self->want_init = (moq_bytes_t) { NULL, 0 };
             } else {
               GST_ELEMENT_ERROR (self, CORE, NEGOTIATION,
                   ("track \"%s\" is a LOC track with codec %.*s; set the "

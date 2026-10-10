@@ -87,7 +87,9 @@ set_target_properties(gstmoq PROPERTIES
     OUTPUT_NAME "gstmoq"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins")
 
-# Unit tests: plain GLib executables, no GStreamer pipeline, no network.
+# Unit tests: no relay and no socket in any of them. The first two are plain
+# GLib executables over a single source file; test_track_barrier drives the real
+# moqsink element and so links GStreamer, faking libmoq at the link seam.
 include(CTest)
 if(BUILD_TESTING)
     pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
@@ -127,6 +129,18 @@ if(BUILD_TESTING)
     target_link_libraries(test_codec_string PRIVATE PkgConfig::GLIB moq::cmaf moq::core)
     target_compile_options(test_codec_string PRIVATE -Wall -Wextra)
     add_test(NAME codec_string COMMAND test_codec_string)
+
+    # Real element/pad code with portable public-service mocks; no sockets.
+    add_executable(test_track_barrier
+        tests/test_track_barrier.c
+        src/gstmoqsink.c src/gstmoqsinkpad.c src/gstmoqfmp4.c src/gstmoqcodec.c)
+    target_include_directories(test_track_barrier PRIVATE src
+        $<TARGET_PROPERTY:moq::service,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(test_track_barrier PRIVATE
+        PkgConfig::GST PkgConfig::GLIB moq::cmaf moq::core)
+    target_compile_options(test_track_barrier PRIVATE -Wall -Wextra)
+    add_test(NAME track_barrier COMMAND test_track_barrier)
+    set_tests_properties(track_barrier PROPERTIES TIMEOUT 15)
 
     add_test(NAME smoke
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh ${CMAKE_BINARY_DIR}/plugins)
