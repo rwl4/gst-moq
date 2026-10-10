@@ -40,6 +40,8 @@ moq_endpoint_stop (moq_endpoint_t *ep)
   (void)ep;
   return MOQ_OK;
 }
+moq_result_t moq_endpoint_post (moq_endpoint_t *ep, moq_endpoint_task_fn fn, void *ctx)
+{ (void) fn (ep, (moq_session_t *) ep, 0, ctx); return MOQ_OK; }
 void
 moq_endpoint_destroy (moq_endpoint_t *ep)
 {
@@ -231,6 +233,11 @@ pad (GstMoqSink *s, gboolean track)
       gst_element_request_pad_simple (GST_ELEMENT (s), "audio_%u"));
   if (track)
     {
+      if (!s->sender) {
+        s->preparing_tracks = g_ptr_array_new_with_free_func (prepared_track_free);
+        g_assert_true (gst_moq_sink_open_sender (s));
+        g_clear_pointer (&s->preparing_tracks, g_ptr_array_unref);
+      }
       moq_media_track_cfg_t c;
       moq_media_track_cfg_init (&c);
       g_assert_cmpint (moq_media_sender_add_track (s->sender, &c, &p->track),
@@ -427,7 +434,7 @@ test_restart (void)
   g_assert_null (p->track);
   g_assert_false (p->eos);
   g_assert_cmpuint (p->splitter.buf->len, ==, 0);
-  g_assert_cmpuint (connects, ==, 2);
+  g_assert_cmpuint (connects, ==, 1); /* reconnect is deferred until media */
   release (s, p);
   finish (s);
 }
@@ -475,6 +482,7 @@ test_ready_callback (gconstpointer early)
   GstMoqSink *s = make_sink ();
   gst_element_set_state (GST_ELEMENT (s), GST_STATE_PAUSED);
   g_assert_true (s->started);
+  GstMoqSinkPad *p = pad (s, TRUE);
   g_assert_cmpuint (ready_logs, ==, ready_during_attach ? 1 : 0);
   if (!ready_during_attach) {
     /* Attach success is not readiness; only the callback emits the record. */
@@ -489,6 +497,7 @@ test_ready_callback (gconstpointer early)
   gst_debug_remove_log_function (capture_ready);
   gst_debug_add_log_function (gst_debug_log_default, NULL, NULL);
   gst_debug_category_set_threshold (gst_moq_sink_debug, previous);
+  release (s, p);
   finish (s);
   g_type_class_unref (klass);
 }

@@ -422,6 +422,9 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
           self->track_ever_seen = TRUE;
           self->want_init = d->init_data;
           self->init_pushed = FALSE;
+          if (d->info.packaging == MOQ_MEDIA_PACKAGING_RAW &&
+              d->codec.len >= 4 && memcmp (d->codec.data, "mp4a", 4) == 0)
+            self->want_init = (moq_bytes_t) { NULL, 0 };
           if (!self->caps || gst_caps_is_any (self->caps)) {
             GstCaps *c = NULL;
             if (d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF) {
@@ -439,7 +442,7 @@ gst_moq_src_drain_track_events (GstMoqSrc *self)
                * the catalog, so it becomes codec_data rather than a pushed init
                * segment -- unlike CMAF, where qtdemux reads it from the moov. */
               c = gst_caps_new_simple ("audio/mpeg",
-                  "mpeg-version", G_TYPE_INT, 4,
+                  "mpegversion", G_TYPE_INT, 4,
                   "stream-format", G_TYPE_STRING, "raw", NULL);
               if (d->has_samplerate && d->samplerate)
                 gst_caps_set_simple (c, "rate", G_TYPE_INT,

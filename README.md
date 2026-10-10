@@ -70,10 +70,12 @@ negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
 `sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout`,
 `latency` (ms reported through the LATENCY query so synced sinks absorb
 network jitter instead of dropping late frames; default 200) and `caps`,
-which is optional for CMAF and H.264 LOC — it is derived from the catalog
+which is optional for CMAF, AAC-LC LOC and H.264 LOC — it is derived from the catalog
 when omitted. Automatic H.264 LOC caps describe Annex B access units;
 length-prefixed payloads and catalog-only decoder configuration are not yet
-handled automatically. Other LOC codecs require explicit compatible caps.
+handled automatically; for length-prefixed AVC, supply explicit `video/x-h264,
+stream-format=avc,alignment=au` caps including the matching `codec_data`.
+Other LOC codecs require explicit compatible caps.
 
 `moqsink` is a plain `GstElement`, not a `GstBaseSink`: it does not preroll,
 so `READY` to `PAUSED` returns immediately instead of waiting for the first
@@ -103,7 +105,7 @@ gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace
   videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse config-interval=-1 \
     ! video/x-h264,stream-format=byte-stream,alignment=au ! ms.sink \
   audiotestsrc is-live=true ! voaacenc ! aacparse \
-    ! audio/mpeg,mpeg-version=4,stream-format=raw ! ms.audio
+    ! audio/mpeg,mpegversion=4,stream-format=raw ! ms.audio
 ```
 
 The audio pad wants **raw** AAC, not ADTS: the decoder config travels in the
@@ -199,3 +201,23 @@ released MOQ5 package; older transport-only drain implementations are insufficie
 Consumers must supply a MOQ5 SDK with these service-drain guarantees; a public
 minimum revision has not yet been established. Relay catalog bootstrap support
 is a separate requirement for playback against a given relay.
+
+
+LOC audio publishing accepts AAC-LC with a supported two-byte
+AudioSpecificConfig, an indexed sample rate and an explicit channel configuration.
+The config must agree with any rate/channels in caps. HE-AAC, explicit-frequency
+core dependencies, extension/trailing config and program-config-element forms are rejected rather than guessed. This
+restriction applies to LOC publishing, not the existing CMAF codec-string support.
+
+Publishing connects after every linked pad has prepared its first track. Put
+queues before pads fed by a common upstream streaming task. `catalog-wait-ms`
+(default 3000) bounds that wait: an incomplete track set reports an error and
+opens no connection. Initial attach/add runs in one MOQ5 endpoint task before
+the first sender pump, so it cannot publish a partial initial catalog. Link all
+publishing pads before the first buffer; restart through READY to change the
+initial stream set. Empty streams finish without opening a connection.
+`catalog-refresh-ms` defaults to zero; opt into refresh only for relay cache
+compatibility. Capture timestamps use each pad's segment running time so encoder
+PTS offsets do not shift audio against video. Audio group boundaries follow
+observed video keyframe boundaries, with `loc-audio-group-ms` as an upper bound;
+this does not guarantee simultaneous delivery by the relay.

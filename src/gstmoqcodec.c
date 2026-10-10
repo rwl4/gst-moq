@@ -43,7 +43,7 @@ gst_moq_codec_aac_asc_params (const guint8 *asc, gsize len, gint *rate,
    * channelConfiguration(4). */
   static const gint freq[13] = { 96000, 88200, 64000, 48000, 44100, 32000,
     24000, 22050, 16000, 12000, 11025, 8000, 7350 };
-  if (!asc || len < 2)
+  if (!asc || len != 2 || (asc[0] >> 3) != 2 || (asc[1] & 0x03) != 0)
     return FALSE;
   guint idx = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
   if (idx >= G_N_ELEMENTS (freq))

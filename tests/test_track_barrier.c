@@ -1,50 +1,27 @@
-/* tests/test_track_barrier.c -- the initial-catalog track barrier.
- *
- * REGRESSION TARGET. libmoq freezes the INITIAL catalog on the sender's first
- * pass after the session reaches ESTABLISHED, from whatever tracks exist at
- * that instant. A track added later stages a generation that is only installed
- * where the catalog already has demand, so with catalog-refresh-ms=0 and no
- * subscriber yet it never reaches the wire. moqsink derives each LOC track from
- * its pad's first keyframe, and the audio pad's first buffer can precede the
- * video pad's by a second, so attaching on the first pad published an
- * audio-only catalog that stayed stale for the whole session -- every
- * subscriber saw one track. gst_moq_sink_await_tracks holds the endpoint
- * connect and the sender attach until every LINKED pad has prepared its track.
- *
- * PRIMARY ORACLE (deterministic, no timing): the call log interleaves a marker
- * written by the test thread with the libmoq calls the element makes. The
- * marker goes in immediately BEFORE the video buffer is pushed, so
- *
- *     MARK("push-video")  must precede  CONNECT
- *
- * is an ordering assertion, not a race: on the pre-barrier code the audio
- * buffer alone drove connect + attach + add_track, so CONNECT would be logged
- * before the marker and the assertion fails. Two add_tracks must likewise
- * precede any write -- the session must not be able to establish with a
- * partial track set.
- *
- * SECONDARY (bounded wait, corroborating): the audio push must still be
- * blocked inside the barrier when the marker is written. This confirms the
- * thread is parked in await_tracks rather than having returned early, and is
- * the only timing-dependent check here.
- *
- * ANTI-VACUITY: /barrier/unlinked-pad-excluded drives the same element with the
- * audio pad left unlinked and asserts CONNECT *does* happen on the video buffer
- * alone. If the ordering oracle above could never observe an early connect, or
- * if the barrier deadlocked a single-pad pipeline, that test fails.
- *
- * White-box only in its linkage: the libmoq entry points are replaced at link
- * time with -Wl,--wrap, so nothing here dials a relay or opens a socket. The
- * element source is unmodified.
- */
+/* Real element and pad code with portable public-service mocks. The executor
+ * mock runs asynchronously; its first simulated sender pump snapshots the
+ * track inventory after the posted startup task. No relay or socket is used. */
 #include "gstmoqsink.h"
 
 #include <gst/gst.h>
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
+#include <moq/rcbuf.h>
 
 #include <string.h>
 
+/* Portable public-service mocks, as in the lifecycle suite. */
+void moq_endpoint_cfg_init (moq_endpoint_cfg_t *c)
+{ memset (c, 0, sizeof *c); c->struct_size = sizeof *c; }
+void moq_media_track_cfg_init (moq_media_track_cfg_t *c)
+{ memset (c, 0, sizeof *c); c->struct_size = sizeof *c; }
+void moq_media_sender_cfg_init_live_sized (moq_media_sender_cfg_t *c, size_t n)
+{ g_assert_cmpuint (n, ==, sizeof *c); memset (c, 0, n); c->struct_size = n; }
+void moq_media_sender_callbacks_init_sized (moq_media_sender_callbacks_t *c, size_t n)
+{ g_assert_cmpuint (n, ==, sizeof *c); memset (c, 0, n); c->struct_size = n; }
+
+moq_result_t moq_endpoint_wait (moq_endpoint_t *ep, uint64_t us)
+{ (void) ep; (void) us; return MOQ_OK; }
 /* -- call log ------------------------------------------------------------- */
 
 typedef enum
@@ -122,10 +99,75 @@ static int fake_sender;
 static int fake_track_video;
 static int fake_track_audio;
 
-moq_result_t __wrap_moq_endpoint_connect (const moq_endpoint_cfg_t *cfg,
+static GMutex task_lock;
+static GCond task_cond;
+static moq_endpoint_task_fn pending_fn;
+static void *pending_ctx;
+static moq_endpoint_t *pending_ep;
+static GThread *task_thread;
+static gboolean task_queued, hold_task, hold_running, running_entered;
+static gboolean inside_task;
+static guint expected_tracks, pump_snapshots, task_closed, added_tracks;
+static guint fail_add;
+static gboolean fail_attach, fail_post;
+static guint64 capture_video, capture_audio;
+static guint audio_groups;
+static gboolean barrier_waiting;
+
+static void
+observe_wait (GstDebugCategory *category, GstDebugLevel level,
+    const gchar *file, const gchar *function, gint line, GObject *object,
+    GstDebugMessage *message, gpointer data)
+{
+  (void) category; (void) level; (void) file; (void) function;
+  (void) line; (void) object; (void) data;
+  if (g_strcmp0 (gst_debug_message_get (message), "waiting for linked track set") == 0) {
+    g_mutex_lock (&task_lock);
+    barrier_waiting = TRUE;
+    g_cond_broadcast (&task_cond);
+    g_mutex_unlock (&task_lock);
+  }
+}
+
+static gpointer
+run_posted (gpointer unused)
+{
+  (void) unused;
+  g_mutex_lock (&task_lock);
+  moq_endpoint_task_fn fn = pending_fn;
+  void *ctx = pending_ctx;
+  moq_endpoint_t *ep = pending_ep;
+  pending_fn = NULL;
+  inside_task = TRUE;
+  g_mutex_unlock (&task_lock);
+  moq_result_t rc = fn (ep, (moq_session_t *) ep, 0, ctx);
+  if (rc == MOQ_OK) {
+    g_assert_cmpuint (added_tracks, ==, expected_tracks);
+    pump_snapshots++;
+  }
+  inside_task = FALSE;
+  return NULL;
+}
+
+moq_result_t
+moq_endpoint_post (moq_endpoint_t *ep, moq_endpoint_task_fn fn, void *ctx)
+{
+  if (fail_post)
+    return MOQ_ERR_NOMEM;
+  g_mutex_lock (&task_lock);
+  pending_fn = fn; pending_ctx = ctx; pending_ep = ep;
+  task_queued = TRUE;
+  g_cond_broadcast (&task_cond);
+  if (!hold_task)
+    task_thread = g_thread_new ("mock-network", run_posted, NULL);
+  g_mutex_unlock (&task_lock);
+  return MOQ_OK; /* Scheduling success is independent of the task result. */
+}
+
+moq_result_t moq_endpoint_connect (const moq_endpoint_cfg_t *cfg,
     moq_endpoint_t **out);
 moq_result_t
-__wrap_moq_endpoint_connect (const moq_endpoint_cfg_t *cfg,
+moq_endpoint_connect (const moq_endpoint_cfg_t *cfg,
     moq_endpoint_t **out)
 {
   (void) cfg;
@@ -134,58 +176,80 @@ __wrap_moq_endpoint_connect (const moq_endpoint_cfg_t *cfg,
   return MOQ_OK;
 }
 
-moq_result_t __wrap_moq_endpoint_stop (moq_endpoint_t *ep);
+moq_result_t moq_endpoint_stop (moq_endpoint_t *ep);
 moq_result_t
-__wrap_moq_endpoint_stop (moq_endpoint_t *ep)
+moq_endpoint_stop (moq_endpoint_t *ep)
 {
-  (void) ep;
+  if (task_thread) {
+    g_thread_join (task_thread);
+    task_thread = NULL;
+  }
+  if (pending_fn) {
+    inside_task = TRUE;
+    g_assert_cmpint (pending_fn (ep, NULL, 0, pending_ctx), ==, MOQ_ERR_INTERRUPTED);
+    inside_task = FALSE;
+    pending_fn = NULL;
+    task_closed++;
+  }
   return MOQ_OK;
 }
 
-void __wrap_moq_endpoint_destroy (moq_endpoint_t *ep);
+void moq_endpoint_destroy (moq_endpoint_t *ep);
 void
-__wrap_moq_endpoint_destroy (moq_endpoint_t *ep)
+moq_endpoint_destroy (moq_endpoint_t *ep)
 {
   (void) ep;
 }
 
-void __wrap_moq_endpoint_set_interrupted (moq_endpoint_t *ep, bool interrupted);
+void moq_endpoint_set_interrupted (moq_endpoint_t *ep, bool interrupted);
 void
-__wrap_moq_endpoint_set_interrupted (moq_endpoint_t *ep, bool interrupted)
+moq_endpoint_set_interrupted (moq_endpoint_t *ep, bool interrupted)
 {
   (void) ep;
   (void) interrupted;
 }
 
-moq_result_t __wrap_moq_endpoint_drain (moq_endpoint_t *ep, uint64_t timeout_us);
+moq_result_t moq_endpoint_drain (moq_endpoint_t *ep, uint64_t timeout_us);
 moq_result_t
-__wrap_moq_endpoint_drain (moq_endpoint_t *ep, uint64_t timeout_us)
+moq_endpoint_drain (moq_endpoint_t *ep, uint64_t timeout_us)
 {
   (void) ep;
   (void) timeout_us;
   return MOQ_OK;
 }
 
-moq_result_t __wrap_moq_media_sender_attach (moq_endpoint_t *ep,
+moq_result_t moq_media_sender_attach (moq_endpoint_t *ep,
     const moq_media_sender_cfg_t *cfg, moq_media_sender_t **out);
 moq_result_t
-__wrap_moq_media_sender_attach (moq_endpoint_t *ep,
+moq_media_sender_attach (moq_endpoint_t *ep,
     const moq_media_sender_cfg_t *cfg, moq_media_sender_t **out)
 {
   (void) ep;
   (void) cfg;
+  g_assert_true (inside_task); /* Fails if attach escapes the managed turn. */
   log_add (OP_ATTACH, NULL);
+  g_mutex_lock (&task_lock);
+  running_entered = TRUE;
+  g_cond_broadcast (&task_cond);
+  while (hold_running)
+    g_cond_wait (&task_cond, &task_lock);
+  g_mutex_unlock (&task_lock);
+  if (fail_attach)
+    return MOQ_ERR_NOMEM;
   *out = (moq_media_sender_t *) &fake_sender;
   return MOQ_OK;
 }
 
-moq_result_t __wrap_moq_media_sender_add_track (moq_media_sender_t *s,
+moq_result_t moq_media_sender_add_track (moq_media_sender_t *s,
     const moq_media_track_cfg_t *cfg, moq_media_track_t **out);
 moq_result_t
-__wrap_moq_media_sender_add_track (moq_media_sender_t *s,
+moq_media_sender_add_track (moq_media_sender_t *s,
     const moq_media_track_cfg_t *cfg, moq_media_track_t **out)
 {
   (void) s;
+  added_tracks++;
+  if (fail_add == added_tracks)
+    return MOQ_ERR_NOMEM;
   gchar *name = g_strndup ((const gchar *) cfg->name.data, cfg->name.len);
   log_add (OP_ADD_TRACK, name);
   *out = (moq_media_track_t *) (cfg->media_type == MOQ_MEDIA_TYPE_AUDIO
@@ -194,23 +258,29 @@ __wrap_moq_media_sender_add_track (moq_media_sender_t *s,
   return MOQ_OK;
 }
 
-moq_result_t __wrap_moq_media_sender_write (moq_media_sender_t *s,
+moq_result_t moq_media_sender_write (moq_media_sender_t *s,
     moq_media_track_t *track, const moq_media_send_object_t *obj);
 moq_result_t
-__wrap_moq_media_sender_write (moq_media_sender_t *s,
+moq_media_sender_write (moq_media_sender_t *s,
     moq_media_track_t *track, const moq_media_send_object_t *obj)
 {
   (void) s;
-  (void) obj;
+  if (track == (moq_media_track_t *) &fake_track_audio) {
+    capture_audio = obj->capture_time_us;
+    if (obj->starts_group) audio_groups++;
+  } else {
+    capture_video = obj->capture_time_us;
+  }
+  moq_rcbuf_decref (obj->payload);
   log_add (OP_WRITE, track == (moq_media_track_t *) &fake_track_audio
       ? "audio" : "video");
   return MOQ_OK;
 }
 
-moq_result_t __wrap_moq_media_sender_end_track (moq_media_sender_t *s,
+moq_result_t moq_media_sender_end_track (moq_media_sender_t *s,
     moq_media_track_t *track);
 moq_result_t
-__wrap_moq_media_sender_end_track (moq_media_sender_t *s,
+moq_media_sender_end_track (moq_media_sender_t *s,
     moq_media_track_t *track)
 {
   (void) s;
@@ -218,26 +288,26 @@ __wrap_moq_media_sender_end_track (moq_media_sender_t *s,
   return MOQ_OK;
 }
 
-bool __wrap_moq_media_sender_is_fatal (const moq_media_sender_t *s);
+bool moq_media_sender_is_fatal (const moq_media_sender_t *s);
 bool
-__wrap_moq_media_sender_is_fatal (const moq_media_sender_t *s)
+moq_media_sender_is_fatal (const moq_media_sender_t *s)
 {
   (void) s;
   return false;
 }
 
-uint64_t __wrap_moq_media_sender_fatal_code (const moq_media_sender_t *s);
+uint64_t moq_media_sender_fatal_code (const moq_media_sender_t *s);
 uint64_t
-__wrap_moq_media_sender_fatal_code (const moq_media_sender_t *s)
+moq_media_sender_fatal_code (const moq_media_sender_t *s)
 {
   (void) s;
   return 0;
 }
 
-moq_result_t __wrap_moq_media_sender_get_stats (const moq_media_sender_t *s,
+moq_result_t moq_media_sender_get_stats (const moq_media_sender_t *s,
     moq_media_sender_stats_t *out, size_t out_size);
 moq_result_t
-__wrap_moq_media_sender_get_stats (const moq_media_sender_t *s,
+moq_media_sender_get_stats (const moq_media_sender_t *s,
     moq_media_sender_stats_t *out, size_t out_size)
 {
   (void) s;
@@ -245,9 +315,9 @@ __wrap_moq_media_sender_get_stats (const moq_media_sender_t *s,
   return MOQ_OK;
 }
 
-void __wrap_moq_media_sender_destroy (moq_media_sender_t *s);
+void moq_media_sender_destroy (moq_media_sender_t *s);
 void
-__wrap_moq_media_sender_destroy (moq_media_sender_t *s)
+moq_media_sender_destroy (moq_media_sender_t *s)
 {
   (void) s;
 }
@@ -279,18 +349,8 @@ static GstCaps *
 audio_caps (void)
 {
   GstBuffer *cd = gst_buffer_new_memdup (asc, sizeof asc);
-  /* BOTH spellings on purpose. "mpegversion" is what aacparse names the field;
-   * the pad template spells it "mpeg-version", and accept-caps is a SUBSET test
-   * (gst_caps_is_subset), so caps missing the template's field are rejected
-   * outright -- the CAPS event never reaches the element. A real pipeline never
-   * trips on this because negotiation intersects with the template and folds
-   * "mpeg-version" in; pushing caps by hand here does not, so the test has to
-   * supply what negotiation would have produced. The template's spelling looks
-   * like a typo (nothing reads it, and no decoder emits it), but it is load
-   * bearing for accept-caps, so leave it to a separate change. */
   GstCaps *caps = gst_caps_new_simple ("audio/mpeg",
       "mpegversion", G_TYPE_INT, 4,
-      "mpeg-version", G_TYPE_INT, 4,
       "stream-format", G_TYPE_STRING, "raw",
       "rate", G_TYPE_INT, 48000,
       "channels", G_TYPE_INT, 2,
@@ -393,6 +453,8 @@ static void
 test_initial_catalog_complete (void)
 {
   log_reset ();
+  expected_tracks = 2;
+  added_tracks = 0;
   GstElement *sink = new_sink ();
 
   /* PAUSED first: the element activates its sink pads on READY->PAUSED, and an
@@ -474,6 +536,8 @@ static void
 test_unlinked_pad_excluded (void)
 {
   log_reset ();
+  expected_tracks = 1;
+  added_tracks = 0;
   GstElement *sink = new_sink ();
 
   g_assert_cmpint (gst_element_set_state (sink, GST_STATE_PAUSED), !=,
@@ -499,15 +563,265 @@ test_unlinked_pad_excluded (void)
   gst_object_unref (sink);
 }
 
+static void
+close_source (GstPad *src)
+{
+  gst_pad_set_active (src, FALSE);
+  gst_object_unref (src);
+}
+
+static void
+test_timeout (void)
+{
+  log_reset (); added_tracks = 0;
+  GstElement *sink = new_sink ();
+  g_object_set (sink, "catalog-wait-ms", 10, NULL);
+  GstBus *bus = gst_bus_new ();
+  gst_element_set_bus (sink, bus);
+  gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstPad *asrc = open_src_pad (sink, "audio", "a", audio_caps ());
+  GstPad *vsrc = open_src_pad (sink, "sink", "v", video_caps ());
+  g_assert_cmpint (gst_pad_push (asrc, keyframe (0, 64)), ==, GST_FLOW_ERROR);
+  g_assert_cmpuint (log_count (OP_CONNECT), ==, 0);
+  g_assert_cmpuint (log_count (OP_WRITE), ==, 0);
+  GstMessage *m = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
+  g_assert_nonnull (m); gst_message_unref (m);
+  gst_element_set_state (sink, GST_STATE_NULL);
+  close_source (asrc); close_source (vsrc);
+  gst_element_set_bus (sink, NULL); gst_object_unref (bus); gst_object_unref (sink);
+}
+
+static void
+test_empty (void)
+{
+  log_reset ();
+  GstElement *sink = new_sink ();
+  GstBus *bus = gst_bus_new (); gst_element_set_bus (sink, bus);
+  gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstPad *src = open_src_pad (sink, "sink", "v", video_caps ());
+  g_assert_true (gst_pad_push_event (src, gst_event_new_eos ()));
+  g_assert_cmpuint (log_count (OP_CONNECT), ==, 0);
+  GstMessage *m = gst_bus_pop_filtered (bus, GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+  g_assert_nonnull (m); g_assert_cmpint (GST_MESSAGE_TYPE (m), ==, GST_MESSAGE_EOS);
+  gst_message_unref (m);
+  gst_element_set_state (sink, GST_STATE_NULL); close_source (src);
+  gst_element_set_bus (sink, NULL); gst_object_unref (bus); gst_object_unref (sink);
+}
+
+static void
+init_job (PushJob *job, GstPad *src)
+{
+  memset (job, 0, sizeof *job);
+  job->src = src; job->buffer = keyframe (0, 64);
+  g_mutex_init (&job->lock); g_cond_init (&job->cond);
+}
+
+static void
+join_job (PushJob *job, GThread *thread, GstFlowReturn ret)
+{
+  g_thread_join (thread);
+  g_assert_cmpint (job->ret, ==, ret);
+  g_mutex_clear (&job->lock); g_cond_clear (&job->cond);
+}
+
+static void
+test_flush (gconstpointer state_change)
+{
+  barrier_waiting = FALSE;
+  gst_debug_add_log_function (observe_wait, NULL, NULL);
+  gst_debug_set_threshold_for_name ("moqsink", GST_LEVEL_DEBUG);
+  log_reset (); task_queued = FALSE; added_tracks = 0;
+  GstElement *sink = new_sink ();
+  g_object_set (sink, "catalog-wait-ms", 5000, NULL);
+  gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstPad *asrc = open_src_pad (sink, "audio", "a", audio_caps ());
+  GstPad *vsrc = open_src_pad (sink, "sink", "v", video_caps ());
+  PushJob job; init_job (&job, asrc);
+  GThread *thread = g_thread_new ("push", push_thread, &job);
+  g_mutex_lock (&task_lock);
+  gint64 wait_limit = g_get_monotonic_time () + G_TIME_SPAN_SECOND;
+  while (!barrier_waiting && g_cond_wait_until (&task_cond, &task_lock, wait_limit)) ;
+  g_assert_true (barrier_waiting);
+  g_mutex_unlock (&task_lock);
+  if (GPOINTER_TO_INT (state_change))
+    g_assert_cmpint (gst_element_set_state (sink, GST_STATE_READY), !=, GST_STATE_CHANGE_FAILURE);
+  else
+    g_assert_true (gst_pad_push_event (asrc, gst_event_new_flush_start ()));
+  g_mutex_lock (&job.lock);
+  gint64 limit = g_get_monotonic_time () + G_TIME_SPAN_SECOND;
+  while (!job.done && g_cond_wait_until (&job.cond, &job.lock, limit)) ;
+  g_assert_true (job.done);
+  g_mutex_unlock (&job.lock);
+  join_job (&job, thread, GST_FLOW_FLUSHING);
+  g_assert_cmpuint (log_count (OP_CONNECT), ==, 0);
+  gst_element_set_state (sink, GST_STATE_NULL);
+  close_source (asrc); close_source (vsrc); gst_object_unref (sink);
+  gst_debug_remove_log_function (observe_wait);
+  gst_debug_unset_threshold_for_name ("moqsink");
+}
+
+static void
+test_start_failure (gconstpointer mode_ptr)
+{
+  guint mode = GPOINTER_TO_UINT (mode_ptr);
+  log_reset (); task_queued = FALSE; added_tracks = 0; expected_tracks = 1;
+  hold_task = mode == 0; fail_post = mode == 1; fail_attach = mode == 2;
+  fail_add = mode == 3 ? 1 : 0;
+  GstElement *sink = new_sink (); gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstPad *src = open_src_pad (sink, "sink", "v", video_caps ());
+  if (hold_task) {
+    PushJob job; init_job (&job, src);
+    GThread *thread = g_thread_new ("push", push_thread, &job);
+    g_mutex_lock (&task_lock);
+    gint64 limit = g_get_monotonic_time () + G_TIME_SPAN_SECOND;
+    while (!task_queued && g_cond_wait_until (&task_cond, &task_lock, limit)) ;
+    g_assert_true (task_queued);
+    g_mutex_unlock (&task_lock);
+    g_assert_true (gst_pad_push_event (src, gst_event_new_flush_start ()));
+    join_job (&job, thread, GST_FLOW_FLUSHING);
+    g_assert_cmpuint (task_closed, ==, 1);
+    g_assert_cmpuint (log_count (OP_ATTACH), ==, 0);
+  } else {
+    g_assert_cmpint (gst_pad_push (src, keyframe (0, 64)), ==, GST_FLOW_ERROR);
+  }
+  g_assert_cmpuint (log_count (OP_WRITE), ==, 0);
+  gst_element_set_state (sink, GST_STATE_NULL); close_source (src); gst_object_unref (sink);
+  hold_task = fail_post = fail_attach = FALSE; fail_add = task_closed = 0;
+}
+
+static gpointer
+release_running_on_flush (gpointer data)
+{
+  GstPad *sinkpad = data;
+  /* Public flushing flag is set by FLUSH_START before invoking the handler. */
+  gint64 limit = g_get_monotonic_time () + G_TIME_SPAN_SECOND;
+  while (!GST_PAD_IS_FLUSHING (sinkpad) && g_get_monotonic_time () < limit)
+    g_thread_yield ();
+  g_assert_true (GST_PAD_IS_FLUSHING (sinkpad));
+  g_mutex_lock (&task_lock); hold_running = FALSE;
+  g_cond_broadcast (&task_cond); g_mutex_unlock (&task_lock);
+  return NULL;
+}
+
+static void
+test_running_cancel (void)
+{
+  log_reset (); added_tracks = 0; expected_tracks = 1; running_entered = FALSE;
+  hold_running = TRUE;
+  GstElement *sink = new_sink (); gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstPad *src = open_src_pad (sink, "sink", "v", video_caps ());
+  PushJob job; init_job (&job, src);
+  GThread *thread = g_thread_new ("push", push_thread, &job);
+  g_mutex_lock (&task_lock);
+  gint64 limit = g_get_monotonic_time () + G_TIME_SPAN_SECOND;
+  while (!running_entered && g_cond_wait_until (&task_cond, &task_lock, limit)) ;
+  g_assert_true (running_entered); g_mutex_unlock (&task_lock);
+  GstPad *sinkpad = gst_element_get_static_pad (sink, "sink");
+  GThread *release = g_thread_new ("release-task", release_running_on_flush, sinkpad);
+  g_assert_true (gst_pad_push_event (src, gst_event_new_flush_start ()));
+  g_thread_join (release); gst_object_unref (sinkpad);
+  join_job (&job, thread, GST_FLOW_FLUSHING);
+  g_assert_cmpuint (log_count (OP_WRITE), ==, 0);
+  gst_element_set_state (sink, GST_STATE_NULL); close_source (src); gst_object_unref (sink);
+}
+
+static void
+test_partial_add_failure (void)
+{
+  log_reset (); added_tracks = 0; expected_tracks = 2; fail_add = 2;
+  GstElement *sink = new_sink (); gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstPad *asrc = open_src_pad (sink, "audio", "a", audio_caps ());
+  GstPad *vsrc = open_src_pad (sink, "sink", "v", video_caps ());
+  PushJob job; init_job (&job, asrc);
+  GThread *thread = g_thread_new ("push", push_thread, &job);
+  g_assert_cmpint (gst_pad_push (vsrc, keyframe (0, 64)), ==, GST_FLOW_ERROR);
+  join_job (&job, thread, GST_FLOW_ERROR);
+  g_assert_cmpuint (added_tracks, ==, 2);
+  g_assert_cmpuint (log_count (OP_WRITE), ==, 0);
+  gst_element_set_state (sink, GST_STATE_NULL);
+  close_source (asrc); close_source (vsrc); gst_object_unref (sink); fail_add = 0;
+}
+
+static void
+test_bad_audio_config (gconstpointer mode_ptr)
+{
+  guint mode = GPOINTER_TO_UINT (mode_ptr);
+  log_reset ();
+  GstElement *sink = new_sink (); gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstCaps *caps = audio_caps ();
+  guint8 config[] = {mode == 1 ? 0x2a : 0x11, 0x90};
+  GstBuffer *cd = gst_buffer_new_memdup (config, mode == 0 ? 1 : 2);
+  gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER, cd, NULL);
+  if (mode == 2) gst_caps_set_simple (caps, "rate", G_TYPE_INT, 44100, NULL);
+  gst_buffer_unref (cd);
+  GstPad *src = open_src_pad (sink, "audio", "a", caps);
+  g_assert_cmpint (gst_pad_push (src, keyframe (0, 64)), ==, GST_FLOW_ERROR);
+  g_assert_cmpuint (log_count (OP_CONNECT), ==, 0);
+  gst_element_set_state (sink, GST_STATE_NULL); close_source (src); gst_object_unref (sink);
+}
+
+static void
+push_segment (GstPad *src, GstClockTime offset)
+{
+  GstSegment seg; gst_segment_init (&seg, GST_FORMAT_TIME);
+  seg.start = seg.position = offset;
+  g_assert_true (gst_pad_push_event (src, gst_event_new_segment (&seg)));
+}
+
+static void
+test_timestamps_and_groups (void)
+{
+  log_reset (); added_tracks = 0; expected_tracks = 2; audio_groups = 0;
+  GstElement *sink = new_sink (); gst_element_set_state (sink, GST_STATE_PAUSED);
+  GstPad *asrc = open_src_pad (sink, "audio", "a", audio_caps ());
+  GstPad *vsrc = open_src_pad (sink, "sink", "v", video_caps ());
+  /* Common encoder offset: video PTS is large but running time is zero. */
+  GstClockTime offset = 3600000 * GST_SECOND;
+  push_segment (vsrc, offset);
+  PushJob job; init_job (&job, asrc);
+  GThread *thread = g_thread_new ("push", push_thread, &job);
+  g_assert_cmpint (gst_pad_push (vsrc, keyframe (offset, 64)), ==, GST_FLOW_OK);
+  join_job (&job, thread, GST_FLOW_OK);
+  g_assert_cmpuint (capture_video, ==, capture_audio);
+  guint before = audio_groups;
+  g_assert_cmpint (gst_pad_push (asrc, keyframe (20 * GST_MSECOND, 64)), ==, GST_FLOW_OK);
+  guint after = audio_groups;
+  g_assert_cmpint (gst_pad_push (asrc, keyframe (40 * GST_MSECOND, 64)), ==, GST_FLOW_OK);
+  g_assert_cmpuint (audio_groups, ==, after); /* no group for every AAC AU */
+  g_assert_cmpuint (after, <=, before + 1);
+  g_assert_cmpint (gst_pad_push (vsrc, keyframe (offset + 100 * GST_MSECOND, 64)), ==, GST_FLOW_OK);
+  g_assert_cmpint (gst_pad_push (asrc, keyframe (120 * GST_MSECOND, 64)), ==, GST_FLOW_OK);
+  g_assert_cmpuint (audio_groups, ==, after + 1);
+  gst_element_set_state (sink, GST_STATE_NULL);
+  close_source (asrc); close_source (vsrc); gst_object_unref (sink);
+}
+
 int
 main (int argc, char **argv)
 {
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
   g_mutex_init (&log_lock);
+  g_mutex_init (&task_lock); g_cond_init (&task_cond);
   log_reset ();
   g_test_add_func ("/barrier/initial-catalog-complete",
       test_initial_catalog_complete);
   g_test_add_func ("/barrier/unlinked-pad-excluded", test_unlinked_pad_excluded);
-  return g_test_run ();
+  g_test_add_func ("/barrier/timeout-no-partial", test_timeout);
+  g_test_add_func ("/barrier/empty-eos", test_empty);
+  g_test_add_data_func ("/barrier/flush-cancels", GINT_TO_POINTER (0), test_flush);
+  g_test_add_data_func ("/barrier/state-cancels", GINT_TO_POINTER (1), test_flush);
+  g_test_add_data_func ("/barrier/queued-start-cancel", GUINT_TO_POINTER (0), test_start_failure);
+  g_test_add_data_func ("/barrier/post-rejected", GUINT_TO_POINTER (1), test_start_failure);
+  g_test_add_data_func ("/barrier/attach-failed", GUINT_TO_POINTER (2), test_start_failure);
+  g_test_add_data_func ("/barrier/add-failed", GUINT_TO_POINTER (3), test_start_failure);
+  g_test_add_func ("/barrier/partial-add-failed", test_partial_add_failure);
+  g_test_add_func ("/barrier/running-start-cancel", test_running_cancel);
+  g_test_add_data_func ("/barrier/audio-truncated", GUINT_TO_POINTER (0), test_bad_audio_config);
+  g_test_add_data_func ("/barrier/audio-he-rejected", GUINT_TO_POINTER (1), test_bad_audio_config);
+  g_test_add_data_func ("/barrier/audio-caps-mismatch", GUINT_TO_POINTER (2), test_bad_audio_config);
+  g_test_add_func ("/barrier/capture-and-groups", test_timestamps_and_groups);
+  int result = g_test_run ();
+  log_reset (); g_array_unref (call_log);
+  return result;
 }
