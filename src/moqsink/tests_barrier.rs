@@ -6,6 +6,7 @@
 //! violation rather than a race.
 
 use gst::prelude::*;
+use gst::subclass::prelude::ObjectSubclassIsExt;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -14,15 +15,21 @@ use std::time::{Duration, Instant};
 
 use super::MoqSink;
 use crate::service::fake::{
-    control, log_add, log_count, log_find, release_attach, suite as fake_suite, wait_attach_entered,
-    Op, Suite as FakeSuite,
-};
-use moq5::sys::{
-    moq_cmaf_fragment_info_init, moq_cmaf_init_info_init, moq_cmaf_init_info_t,
-    moq_cmaf_parse_fragment, moq_cmaf_parse_init, moq_cmaf_sample_t, moq_cmaf_fragment_info_t,
-    MOQ_OK,
+    control, log_add, log_count, log_find, release_attach, suite as fake_suite,
+    wait_attach_entered, Op, Suite as FakeSuite,
 };
 use crate::test_support::{bytes, span};
+use moq5::sys::{
+    moq_cmaf_fragment_info_init, moq_cmaf_fragment_info_t, moq_cmaf_init_info_init_sized,
+    moq_cmaf_init_info_t, moq_cmaf_parse_fragment, moq_cmaf_parse_init_sized, moq_cmaf_sample_t,
+    MOQ_OK,
+};
+
+/// Read owned observations before an assertion can unwind the CONTROL mutex.
+fn observe_control<T>(read: impl FnOnce(&crate::service::fake::Control) -> T) -> T {
+    let state = control();
+    read(&state)
+}
 
 // -- fixture -------------------------------------------------------------------
 
@@ -120,14 +127,16 @@ fn keyframe(pts: gst::ClockTime, len: usize) -> gst::Buffer {
     b
 }
 
-fn new_sink() -> MoqSink {
-    gst::glib::Object::builder::<MoqSink>()
+fn new_sink() -> (MoqSink, crate::test_support::NullCleanup) {
+    let sink = gst::glib::Object::builder::<MoqSink>()
         // Never dialled: moq_endpoint_connect is mocked.
         .property("host", "127.0.0.1")
         .property("port", 1u32)
         // No clock waits -- the barrier is what this test times, nothing else.
         .property("sync", false)
-        .build()
+        .build();
+    let cleanup = crate::test_support::NullCleanup::new(&sink);
+    (sink, cleanup)
 }
 
 // -- a push on its own streaming thread ----------------------------------------
@@ -139,19 +148,86 @@ struct JobState {
     ret: Option<Result<gst::FlowSuccess, gst::FlowError>>,
 }
 
+/// A case-owned worker: explicit join preserves the current pipeline, while
+/// unwinding cancels the fixture before waiting for its worker to settle.
+pub(super) struct PushThread<T = ()> {
+    handle: Option<JoinHandle<T>>,
+    target: gst::Element,
+}
+impl<T: Send + 'static> PushThread<T> {
+    pub(super) fn spawn(
+        target: &impl IsA<gst::Element>,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Self {
+        Self {
+            handle: Some(std::thread::spawn(job)),
+            target: target.upcast_ref::<gst::Element>().clone(),
+        }
+    }
+    fn thread(&self) -> &std::thread::Thread {
+        self.handle.as_ref().expect("unjoined worker").thread()
+    }
+    pub(super) fn join(mut self) -> std::thread::Result<T> {
+        self.handle.take().expect("unjoined worker").join()
+    }
+}
+impl<T> Drop for PushThread<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            release_attach();
+            let null = self.target.set_state(gst::State::Null);
+            let joined = handle.join();
+            if std::thread::panicking() {
+                if null.is_err() || joined.is_err() {
+                    eprintln!("WARNING: fixture worker cleanup failed during unwind");
+                }
+            } else {
+                assert!(null.is_ok(), "fixture worker NULL transition failed");
+                assert!(joined.is_ok(), "fixture worker panicked during cleanup");
+            }
+        }
+    }
+}
+
+/// A callback can retain a slot clone; the case still settles its worker
+/// before clock/serial fixture guards are released.
+pub(super) struct PendingThread(Arc<Mutex<Option<PushThread>>>);
+impl PendingThread {
+    pub(super) fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+    pub(super) fn slot(&self) -> Arc<Mutex<Option<PushThread>>> {
+        self.0.clone()
+    }
+    pub(super) fn join(&self) -> std::thread::Result<()> {
+        let worker = self.0.lock().unwrap().take();
+        worker.expect("callback started its worker").join()
+    }
+}
+impl Drop for PendingThread {
+    fn drop(&mut self) {
+        let worker = self.0.lock().unwrap().take();
+        drop(worker);
+    }
+}
+
 struct PushJob {
     state: Mutex<JobState>,
     cond: Condvar,
 }
 
 impl PushJob {
-    fn start(src: &gst::Pad, buffer: gst::Buffer) -> (Arc<PushJob>, JoinHandle<()>) {
+    fn start(src: &gst::Pad, buffer: gst::Buffer) -> (Arc<PushJob>, PushThread) {
         let job = Arc::new(PushJob {
             state: Mutex::new(JobState::default()),
             cond: Condvar::new(),
         });
+        let target = src
+            .peer()
+            .and_then(|peer| peer.parent_element())
+            .expect("linked fixture element");
         let (j, src) = (job.clone(), src.clone());
-        let th = std::thread::spawn(move || {
+        let th = PushThread::spawn(&target, move || {
             {
                 j.state.lock().unwrap().entered = true;
                 j.cond.notify_all();
@@ -186,9 +262,10 @@ impl PushJob {
         s.done
     }
 
-    fn join(self: Arc<Self>, th: JoinHandle<()>, expect: Result<gst::FlowSuccess, gst::FlowError>) {
+    fn join(self: Arc<Self>, th: PushThread, expect: Result<gst::FlowSuccess, gst::FlowError>) {
         th.join().unwrap();
-        assert_eq!(self.state.lock().unwrap().ret, Some(expect));
+        let result = self.state.lock().unwrap().ret;
+        assert_eq!(result, Some(expect));
     }
 }
 
@@ -205,7 +282,7 @@ fn ms(v: u64) -> gst::ClockTime {
 #[test]
 fn initial_catalog_complete() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
 
     // PAUSED first: the element activates its sink pads on READY->PAUSED, and
     // an inactive pad rejects the sticky events open_src_pad pushes.
@@ -262,7 +339,7 @@ fn initial_catalog_complete() {
 #[test]
 fn unlinked_pad_excluded() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
 
     assert!(sink.set_state(gst::State::Paused).is_ok());
 
@@ -287,7 +364,7 @@ fn unlinked_pad_excluded() {
 #[test]
 fn timeout_no_partial() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     sink.set_property("catalog-wait-ms", 10u32);
     let bus = gst::Bus::new();
     sink.set_bus(Some(&bus));
@@ -310,13 +387,14 @@ fn timeout_no_partial() {
 #[test]
 fn empty_eos() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     let bus = gst::Bus::new();
     sink.set_bus(Some(&bus));
     let _ = sink.set_state(gst::State::Paused);
     let src = open_src_pad(&sink, "video", "v", video_caps());
     assert!(src.push_event(gst::event::Eos::new()));
     assert_eq!(log_count(Op::Connect), 0);
+    assert_eq!(log_count(Op::Complete), 0);
     let m = bus
         .pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error])
         .expect("a message");
@@ -340,8 +418,9 @@ fn flush_cancels(state_change: bool) {
     let cat = *super::imp::CAT;
     let previous = cat.threshold();
     cat.set_threshold(gst::DebugLevel::Debug);
+    let log_cleanup = crate::test_support::LogCleanup::new(observe, cat, previous);
 
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     sink.set_property("catalog-wait-ms", 5000u32);
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
@@ -359,8 +438,7 @@ fn flush_cancels(state_change: bool) {
     let _ = sink.set_state(gst::State::Null);
     close_source(asrc);
     close_source(vsrc);
-    gst::log::remove_log_function(observe);
-    cat.set_threshold(previous);
+    drop(log_cleanup);
 }
 
 #[test]
@@ -376,13 +454,6 @@ fn state_cancels_barrier() {
 /// A startup that fails at the service: `attach` refused, or the first
 /// `add_track` refused. Either way no media may be written.
 ///
-/// The old suite had two more modes, for libmoq's posted startup task:
-/// `queued_start_cancel` (flush a task still queued) and `post_rejected`
-/// (`moq_endpoint_post` refusing). The moq5 crate no longer exposes
-/// `moq_endpoint_post`, so the element attaches and adds its tracks directly
-/// and neither case exists; cancelling while the barrier waits is covered by
-/// `flush_cancels_barrier`, and cancelling mid-attach by
-/// `running_start_cancel`.
 fn start_failure(attach: bool) {
     let _suite = suite();
     {
@@ -390,7 +461,7 @@ fn start_failure(attach: bool) {
         c.fail_attach = attach;
         c.fail_add = if attach { 0 } else { 1 };
     }
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let src = open_src_pad(&sink, "video", "v", video_caps());
     assert_eq!(
@@ -416,7 +487,7 @@ fn add_failed() {
 fn partial_add_failed() {
     let _suite = suite();
     control().fail_add = 2;
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
     let vsrc = open_src_pad(&sink, "video", "v", video_caps());
@@ -426,7 +497,7 @@ fn partial_add_failed() {
         Err(gst::FlowError::Error)
     );
     job.join(th, Err(gst::FlowError::Error));
-    assert_eq!(control().added_tracks, 2);
+    assert_eq!(observe_control(|c| c.added_tracks), 2);
     assert_eq!(log_count(Op::Write), 0);
     let _ = sink.set_state(gst::State::Null);
     close_source(asrc);
@@ -437,7 +508,9 @@ fn partial_add_failed() {
 fn running_start_cancel() {
     let _suite = suite();
     control().hold_attach = true;
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
+    let bus = gst::Bus::new();
+    sink.set_bus(Some(&bus));
     let _ = sink.set_state(gst::State::Paused);
     let src = open_src_pad(&sink, "video", "v", video_caps());
     let (job, th) = PushJob::start(&src, keyframe(gst::ClockTime::ZERO, 64));
@@ -445,7 +518,7 @@ fn running_start_cancel() {
     let sinkpad = sink.static_pad("video").unwrap();
     // The pad's public flushing flag is set by FLUSH_START before the handler
     // runs; release the held attach only once it is.
-    let release = std::thread::spawn(move || {
+    let release = PushThread::spawn(&sink, move || {
         let limit = Instant::now() + Duration::from_secs(1);
         while !sinkpad.pad_flags().contains(gst::PadFlags::FLUSHING) && Instant::now() < limit {
             std::thread::yield_now();
@@ -457,6 +530,15 @@ fn running_start_cancel() {
     release.join().unwrap();
     job.join(th, Err(gst::FlowError::Flushing));
     assert_eq!(log_count(Op::Write), 0);
+    assert!(bus.pop_filtered(&[gst::MessageType::Error]).is_none());
+    let observed = !sink.imp().track_lock().tracks_failed;
+    assert!(observed);
+    assert!(src.push_event(gst::event::FlushStop::new(false)));
+    let seg = gst::FormattedSegment::<gst::ClockTime>::new();
+    assert!(src.push_event(gst::event::Segment::new(&seg)));
+    assert_eq!(src.push(keyframe(gst::ClockTime::ZERO, 64)), OK);
+    assert_eq!(log_count(Op::Write), 1);
+    assert!(bus.pop_filtered(&[gst::MessageType::Error]).is_none());
     let _ = sink.set_state(gst::State::Null);
     close_source(src);
 }
@@ -464,7 +546,7 @@ fn running_start_cancel() {
 /// mode 0: truncated ASC; 1: HE-AAC ASC; 2: caps rate disagrees with the ASC.
 fn bad_audio_config(mode: u32) {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let mut caps = audio_caps();
     {
@@ -514,7 +596,7 @@ fn push_segment(src: &gst::Pad, offset: gst::ClockTime) {
 #[test]
 fn capture_and_groups() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
     let vsrc = open_src_pad(&sink, "video", "v", video_caps());
@@ -525,18 +607,18 @@ fn capture_and_groups() {
     assert_eq!(vsrc.push(keyframe(offset, 64)), OK);
     job.join(th, OK);
     {
-        let c = control();
-        assert_eq!(c.capture_video, c.capture_audio);
+        let (video, audio) = observe_control(|c| (c.capture_video, c.capture_audio));
+        assert_eq!(video, audio);
     }
     let before = control().audio_groups;
     assert_eq!(asrc.push(keyframe(ms(20), 64)), OK);
     let after = control().audio_groups;
     assert_eq!(asrc.push(keyframe(ms(40), 64)), OK);
-    assert_eq!(control().audio_groups, after); // no group for every AAC AU
+    assert_eq!(observe_control(|c| c.audio_groups), after); // no group for every AAC AU
     assert!(after <= before + 1);
     assert_eq!(vsrc.push(keyframe(offset + ms(100), 64)), OK);
     assert_eq!(asrc.push(keyframe(ms(120), 64)), OK);
-    assert_eq!(control().audio_groups, after + 1);
+    assert_eq!(observe_control(|c| c.audio_groups), after + 1);
     let _ = sink.set_state(gst::State::Null);
     close_source(asrc);
     close_source(vsrc);
@@ -561,13 +643,14 @@ fn be32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-fn build_cmaf_init(
+fn build_cmaf_init_entry(
     timescale: u32,
     w: u16,
     h: u16,
     protected: bool,
     scheme: &[u8; 4],
     kid: &[u8; 16],
+    sample_entry: &[u8; 4],
 ) -> Vec<u8> {
     let avcc_box = 8 + FIXTURE_AVCC.len();
     // ISO/IEC 23001-7 8.2.2 TrackEncryptionBox body: version/flags(4) +
@@ -618,7 +701,11 @@ fn build_cmaf_init(
     be32(&mut o, 0); // v/f
     be32(&mut o, 1); // entry_count
 
-    box_hdr(&mut o, entry_box, if protected { b"encv" } else { b"avc1" });
+    box_hdr(
+        &mut o,
+        entry_box,
+        if protected { b"encv" } else { sample_entry },
+    );
     let mut entry = [0u8; 78];
     entry[24..26].copy_from_slice(&w.to_be_bytes());
     entry[26..28].copy_from_slice(&h.to_be_bytes());
@@ -630,7 +717,7 @@ fn build_cmaf_init(
     if protected {
         box_hdr(&mut o, sinf_box, b"sinf");
         box_hdr(&mut o, frma_box, b"frma");
-        o.extend_from_slice(b"avc1"); // original format
+        o.extend_from_slice(sample_entry); // effective original format
         box_hdr(&mut o, schm_box, b"schm");
         be32(&mut o, 0); // v/f
         o.extend_from_slice(scheme); // scheme_type
@@ -685,15 +772,47 @@ const WIDEVINE_UUID: &str = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
 const PLAYREADY_UUID: &str = "9a04f079-9840-4286-ab92-e65be0885f95";
 
 /// Drive one CMAF request pad with an init segment and let the barrier commit.
-fn push_cmaf_init(sink: &MoqSink, protected: bool, scheme: &[u8; 4]) {
-    let init = build_cmaf_init(90000, 1920, 1080, protected, scheme, &FIXTURE_KID);
+fn push_cmaf_init(
+    sink: &MoqSink,
+    protected: bool,
+    scheme: &[u8; 4],
+) -> Result<gst::FlowSuccess, gst::FlowError> {
+    push_cmaf_init_flags(sink, protected, scheme, 0)
+}
+
+fn push_cmaf_init_flags(
+    sink: &MoqSink,
+    protected: bool,
+    scheme: &[u8; 4],
+    first_flags: u32,
+) -> Result<gst::FlowSuccess, gst::FlowError> {
+    push_cmaf_init_entry(sink, protected, scheme, first_flags, b"avc1")
+}
+
+fn push_cmaf_init_entry(
+    sink: &MoqSink,
+    protected: bool,
+    scheme: &[u8; 4],
+    first_flags: u32,
+    entry: &[u8; 4],
+) -> Result<gst::FlowSuccess, gst::FlowError> {
+    let init = build_cmaf_init_entry(90000, 1920, 1080, protected, scheme, &FIXTURE_KID, entry);
+    let parsed = moq5::cmaf::CmafInit::parse(init.as_slice()).unwrap();
+    assert_eq!(parsed.info().sample_entry(), Some(*entry));
 
     // The fixture must be what libmoq thinks it is, or nothing below means
     // anything.
     let mut probe = moq_cmaf_init_info_t::default();
     unsafe {
-        moq_cmaf_init_info_init(&mut probe);
-        assert_eq!(moq_cmaf_parse_init(span(&init), &mut probe), MOQ_OK);
+        moq_cmaf_init_info_init_sized(&mut probe, std::mem::size_of::<moq_cmaf_init_info_t>());
+        assert_eq!(
+            moq_cmaf_parse_init_sized(
+                span(&init),
+                &mut probe,
+                std::mem::size_of::<moq_cmaf_init_info_t>()
+            ),
+            MOQ_OK
+        );
     }
     assert_eq!(probe.has_cenc, protected);
     if protected {
@@ -724,7 +843,7 @@ fn push_cmaf_init(sink: &MoqSink, protected: bool, scheme: &[u8; 4]) {
 
     // One sync chunk: this is what makes the splitter release the init, which
     // runs prepare -> barrier -> attach -> add_track.
-    let chunk = build_cmaf_chunk(1, 0 /* sync: non-sync bit clear */);
+    let chunk = build_cmaf_chunk(1, first_flags);
     let mut samples = [moq_cmaf_sample_t::default(); 8];
     let mut fi = moq_cmaf_fragment_info_t::default();
     unsafe {
@@ -734,10 +853,11 @@ fn push_cmaf_init(sink: &MoqSink, protected: bool, scheme: &[u8; 4]) {
 
     let mut cb = gst::Buffer::from_slice(chunk);
     cb.get_mut().unwrap().set_pts(gst::ClockTime::ZERO);
-    assert_eq!(src.push(cb), OK);
+    let result = src.push(cb);
 
     let _ = sink.set_state(gst::State::Null);
     let _ = src.set_active(false);
+    result
 }
 
 /// The contentProtections the element authored on the sender.
@@ -751,13 +871,13 @@ fn cps() -> Vec<moq5::ContentProtection> {
 #[test]
 fn cp_authored_from_init() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     sink.set_property(
         "drm-systems",
         format!("{WIDEVINE_UUID},laurl=https://lic.example/wv,pssh=AAAAQ3Bzc2g="),
     );
 
-    push_cmaf_init(&sink, true, b"cenc");
+    assert_eq!(push_cmaf_init(&sink, true, b"cenc"), OK);
 
     let cps = cps();
     assert_eq!(cps.len(), 1);
@@ -781,7 +901,7 @@ fn cp_authored_from_init() {
 #[test]
 fn cp_two_systems_one_key() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     sink.set_property(
         "drm-systems",
         format!(
@@ -789,7 +909,7 @@ fn cp_two_systems_one_key() {
         ),
     );
 
-    push_cmaf_init(&sink, true, b"cbcs");
+    assert_eq!(push_cmaf_init(&sink, true, b"cbcs"), OK);
 
     let cps = cps();
     assert_eq!(cps.len(), 2);
@@ -806,19 +926,23 @@ fn cp_two_systems_one_key() {
     assert_eq!(track_refs("video").as_deref(), Some("cp0,cp1"));
 }
 
-/// An encrypted track with no DRM system configured: libmoq would reject a
-/// contentProtection with no systemID, so the catalog carries none and the
-/// element warns. Pins the documented fallback rather than a crash or a bogus
-/// entry.
+/// CMSF 4.1.2: absence of protection references means clear content. Refuse an
+/// encrypted stream before connecting when its DRM system is unknown.
 #[test]
 fn cp_encrypted_without_systems() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
 
-    push_cmaf_init(&sink, true, b"cenc");
+    assert_eq!(
+        push_cmaf_init(&sink, true, b"cenc"),
+        Err(gst::FlowError::Error)
+    );
 
     assert!(cps().is_empty());
-    assert_eq!(track_refs("video").as_deref(), Some(""));
+    assert_eq!(log_count(Op::Connect), 0);
+    assert_eq!(log_count(Op::Attach), 0);
+    assert_eq!(log_count(Op::Write), 0);
+    assert!(observe_control(|c| c.added_cfgs.is_empty()));
 }
 
 /// A clear track must never be described as protected, even with drm-systems
@@ -827,11 +951,489 @@ fn cp_encrypted_without_systems() {
 #[test]
 fn cp_clear_track_declares_nothing() {
     let _suite = suite();
-    let sink = new_sink();
+    let (sink, _null_sink) = new_sink();
     sink.set_property("drm-systems", WIDEVINE_UUID);
 
-    push_cmaf_init(&sink, false, b"cenc");
+    assert_eq!(push_cmaf_init(&sink, false, b"cenc"), OK);
 
     assert!(cps().is_empty());
     assert_eq!(track_refs("video").as_deref(), Some(""));
+}
+
+#[test]
+fn refused_startup_never_attaches_or_writes() {
+    let _suite = suite();
+    control().fail_post = true;
+    let (sink, _null_sink) = new_sink();
+    let _ = sink.set_state(gst::State::Paused);
+    let src = open_src_pad(&sink, "video", "v", video_caps());
+    assert_eq!(
+        src.push(keyframe(gst::ClockTime::ZERO, 64)),
+        Err(gst::FlowError::Error)
+    );
+    assert_eq!(log_count(Op::Post), 1);
+    assert_eq!(log_count(Op::Attach), 0);
+    assert_eq!(log_count(Op::Write), 0);
+    let _ = sink.set_state(gst::State::Null);
+    close_source(src);
+}
+
+#[test]
+fn queued_startup_is_cancelled_by_flush() {
+    let _suite = suite();
+    control().hold_startup = true;
+    let (sink, _null_sink) = new_sink();
+    let bus = gst::Bus::new();
+    sink.set_bus(Some(&bus));
+    let _ = sink.set_state(gst::State::Paused);
+    let src = open_src_pad(&sink, "video", "v", video_caps());
+    let (job, thread) = PushJob::start(&src, keyframe(gst::ClockTime::ZERO, 64));
+    crate::service::fake::wait_startup_queued();
+    assert!(src.push_event(gst::event::FlushStart::new()));
+    job.join(thread, Err(gst::FlowError::Flushing));
+    assert_eq!(log_count(Op::Attach), 0);
+    assert_eq!(log_count(Op::Write), 0);
+    assert!(bus.pop_filtered(&[gst::MessageType::Error]).is_none());
+    let observed = !sink.imp().track_lock().tracks_failed;
+    assert!(observed);
+    control().hold_startup = false;
+    assert!(src.push_event(gst::event::FlushStop::new(false)));
+    let seg = gst::FormattedSegment::<gst::ClockTime>::new();
+    assert!(src.push_event(gst::event::Segment::new(&seg)));
+    assert_eq!(src.push(keyframe(gst::ClockTime::ZERO, 64)), OK);
+    assert_eq!(log_count(Op::Attach), 1);
+    assert_eq!(log_count(Op::Write), 1);
+    assert!(bus.pop_filtered(&[gst::MessageType::Error]).is_none());
+    let _ = sink.set_state(gst::State::Null);
+    close_source(src);
+}
+
+#[test]
+fn cmaf_timeline_without_exact_sap_is_rejected_before_connect() {
+    let _suite = suite();
+    let (sink, _null_sink) = new_sink();
+    sink.set_property("sap-timeline", true);
+    assert_eq!(
+        push_cmaf_init(&sink, false, b"cenc"),
+        Err(gst::FlowError::Error)
+    );
+    assert_eq!(log_count(Op::Connect), 0);
+    assert_eq!(log_count(Op::Write), 0);
+}
+
+#[test]
+fn cmaf_sync_group_does_not_claim_exact_sap() {
+    let _suite = suite();
+    for (flags, sync) in [(0, true), (0x0001_0000, false)] {
+        let (sink, _null_sink) = new_sink();
+        let n = control().written_sap.len();
+        assert_eq!(push_cmaf_init_flags(&sink, false, b"cenc", flags), OK);
+        assert_eq!(
+            observe_control(|c| c.written_sap.clone())[n],
+            (sync, sync, None)
+        );
+    }
+}
+
+// Gst-owned application memory may invoke arbitrary safe application code on
+// final release. Drive the real chain so no such destructor reaches native
+// write/rejection, cancellation or endpoint teardown.
+type MemoryReleases = Arc<Mutex<Vec<(std::thread::ThreadId, String)>>>;
+
+struct ApplicationMemory {
+    sink: MoqSink,
+    releases: MemoryReleases,
+    bytes: [u8; 64],
+}
+
+impl AsRef<[u8]> for ApplicationMemory {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for ApplicationMemory {
+    fn drop(&mut self) {
+        // Safe application reentry, deliberately acquires the sink settings
+        // mutex rather than being restricted to a trivial byte deallocation.
+        let host = self.sink.property::<String>("host");
+        self.releases
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), host));
+    }
+}
+
+fn application_memory_release(mode: u32) {
+    let _suite = suite();
+    let (sink, _null_sink) = new_sink();
+    assert!(sink.set_state(gst::State::Paused).is_ok());
+    let src = open_src_pad(&sink, "video", "v", video_caps());
+    let releases = Arc::new(Mutex::new(Vec::new()));
+    let mut buffer = gst::Buffer::from_slice(ApplicationMemory {
+        sink: sink.clone(),
+        releases: releases.clone(),
+        bytes: [0; 64],
+    });
+    buffer.get_mut().unwrap().set_pts(gst::ClockTime::ZERO);
+    buffer.get_mut().unwrap().set_dts(gst::ClockTime::ZERO);
+    let caller = if mode < 2 {
+        if mode == 1 {
+            control().refuse_writes = 1;
+        }
+        assert_eq!(src.push(buffer), OK);
+        if mode == 0 {
+            assert_eq!(log_count(Op::Write), 1);
+        } else {
+            assert_eq!(observe_control(|c| c.refusals), 1);
+            assert_eq!(log_count(Op::Write), 0);
+        }
+        std::thread::current().id()
+    } else {
+        control().hold_startup = true;
+        let (job, thread) = PushJob::start(&src, buffer);
+        let caller = thread.thread().id();
+        crate::service::fake::wait_startup_queued();
+        let observed = releases.lock().unwrap().is_empty();
+        assert!(observed);
+        if mode == 2 {
+            assert!(src.push_event(gst::event::FlushStart::new()));
+        } else {
+            assert!(sink.set_state(gst::State::Null).is_ok());
+        }
+        job.join(thread, Err(gst::FlowError::Flushing));
+        assert_eq!(log_count(Op::Write), 0);
+        caller
+    };
+    let actual_releases = releases.lock().unwrap().clone();
+    assert_eq!(actual_releases, [(caller, "127.0.0.1".into())]);
+    let _ = sink.set_state(gst::State::Null);
+    close_source(src);
+    let observed = releases.lock().unwrap().len();
+    assert_eq!(observed, 1);
+}
+
+#[test]
+fn application_memory_accepted_release() {
+    application_memory_release(0);
+}
+
+#[test]
+fn application_memory_refused_release() {
+    application_memory_release(1);
+}
+
+#[test]
+fn application_memory_flush_release() {
+    application_memory_release(2);
+}
+
+#[test]
+fn application_memory_teardown_release() {
+    application_memory_release(3);
+}
+
+// Flush handlers notify under the track lock. Hold that lock to force both
+// START and STOP to update their object state before an old waiter can resume.
+#[test]
+fn completed_flush_cancels_old_track_waiter() {
+    let _suite = suite();
+    let (sink, _null_sink) = new_sink();
+    sink.set_property("catalog-wait-ms", 1u32);
+    assert!(sink.set_state(gst::State::Paused).is_ok());
+    let bus = gst::Bus::new();
+    sink.set_bus(Some(&bus));
+    let src = open_src_pad(&sink, "video", "v", video_caps());
+    let peer = sink
+        .static_pad("video")
+        .unwrap()
+        .downcast::<super::MoqSinkPad>()
+        .unwrap();
+    let track_guard = sink.imp().track_lock();
+    let old_generation = sink.imp().obj_lock().flush_generation;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let waiter_sink = sink.clone();
+    let waiter_pad = peer.clone();
+    let waiter = PushThread::spawn(&sink, move || {
+        // Snapshot the operation generation before the forced flush cycle.
+        entered_tx.send(()).unwrap();
+        waiter_sink
+            .imp()
+            .await_tracks_generation(&waiter_pad, old_generation)
+    });
+    let entered = entered_rx.recv_timeout(Duration::from_secs(1));
+    let start_sink = sink.clone();
+    let start_pad = peer.clone();
+    let start = PushThread::spawn(&sink, move || {
+        start_sink.imp().set_pad_flush(&start_pad, true)
+    });
+    let start_observed = wait_until(|| sink.imp().obj_lock().flush_count == 1);
+    let stop_sink = sink.clone();
+    let stop_pad = peer.clone();
+    let stop = PushThread::spawn(&sink, move || {
+        stop_sink.imp().set_pad_flush(&stop_pad, false)
+    });
+    let stop_observed = wait_until(|| sink.imp().obj_lock().flush_count == 0);
+    drop(track_guard);
+    start.join().unwrap();
+    stop.join().unwrap();
+    assert!(entered.is_ok());
+    assert!(start_observed);
+    assert!(stop_observed);
+    assert_eq!(waiter.join().unwrap(), Err(gst::FlowError::Flushing));
+    let observed = !sink.imp().track_lock().tracks_failed;
+    assert!(observed);
+    assert!(bus.pop_filtered(&[gst::MessageType::Error]).is_none());
+    let _ = sink.set_state(gst::State::Null);
+    close_source(src);
+}
+
+fn interrupt_snapshot(
+    sink: &MoqSink,
+    pad: &super::MoqSinkPad,
+    thread: &Arc<Mutex<Option<PushThread>>>,
+) -> bool {
+    let flushing_sink = sink.clone();
+    let flushing_pad = pad.clone();
+    *thread.lock().unwrap() = Some(PushThread::spawn(sink, move || {
+        flushing_sink.imp().set_pad_flush(&flushing_pad, true)
+    }));
+    wait_until(|| sink.imp().obj_lock().flush_count == 1)
+}
+
+#[test]
+fn flush_during_snapshot_preparation_is_retryable() {
+    let _suite = suite();
+    let (sink, _null_sink) = new_sink();
+    assert!(sink.set_state(gst::State::Paused).is_ok());
+    let src = open_src_pad(&sink, "video", "v", video_caps());
+    let peer = sink
+        .static_pad("video")
+        .unwrap()
+        .downcast::<super::MoqSinkPad>()
+        .unwrap();
+    let bus = gst::Bus::new();
+    sink.set_bus(Some(&bus));
+    let thread = PendingThread::new();
+    let observer_sink = sink.clone();
+    let observer_pad = peer.clone();
+    let observer_thread = thread.slot();
+    let flush_observed = Arc::new(AtomicBool::new(false));
+    let callback_observed = flush_observed.clone();
+    let once = AtomicBool::new(false);
+    let cat = *super::imp::CAT;
+    let previous = cat.threshold();
+    cat.set_threshold(gst::DebugLevel::Debug);
+    let observer = gst::log::add_log_function(move |_, _, _, _, _, _, msg| {
+        if msg
+            .get()
+            .is_some_and(|m| m.as_str() == "preparing initial track snapshot")
+            && !once.swap(true, Ordering::SeqCst)
+        {
+            callback_observed.store(
+                interrupt_snapshot(&observer_sink, &observer_pad, &observer_thread),
+                Ordering::SeqCst,
+            );
+        }
+    });
+    let log_cleanup = crate::test_support::LogCleanup::new(observer, cat, previous);
+    assert_eq!(
+        src.push(keyframe(gst::ClockTime::ZERO, 64)),
+        Err(gst::FlowError::Flushing)
+    );
+    drop(log_cleanup);
+    assert!(flush_observed.load(Ordering::SeqCst));
+    thread.join().unwrap();
+    let observed = !sink.imp().track_lock().tracks_failed;
+    assert!(observed);
+    assert!(bus.pop_filtered(&[gst::MessageType::Error]).is_none());
+    assert_eq!(log_count(Op::Connect), 0);
+    sink.imp().set_pad_flush(&peer, false);
+    assert_eq!(src.push(keyframe(gst::ClockTime::ZERO, 64)), OK);
+    assert_eq!(log_count(Op::Write), 1);
+    let _ = sink.set_state(gst::State::Null);
+    close_source(src);
+}
+
+fn connect_error_with_flush(cancel: bool) {
+    let _suite = suite();
+    let (sink, _null_sink) = new_sink();
+    assert!(sink.set_state(gst::State::Paused).is_ok());
+    let src = open_src_pad(&sink, "video", "v", video_caps());
+    let peer = sink
+        .static_pad("video")
+        .unwrap()
+        .downcast::<super::MoqSinkPad>()
+        .unwrap();
+    let bus = gst::Bus::new();
+    sink.set_bus(Some(&bus));
+    let thread = PendingThread::new();
+    control().connect_result = Some(moq5::Error::CLOSED);
+    let flush_observed = Arc::new(AtomicBool::new(false));
+    if cancel {
+        let callback_observed = flush_observed.clone();
+        let callback_sink = sink.clone();
+        let callback_pad = peer.clone();
+        let callback_thread = thread.slot();
+        control().on_connect = Some(Box::new(move || {
+            callback_observed.store(
+                interrupt_snapshot(&callback_sink, &callback_pad, &callback_thread),
+                Ordering::SeqCst,
+            );
+        }));
+    }
+    assert_eq!(
+        src.push(keyframe(gst::ClockTime::ZERO, 64)),
+        Err(if cancel {
+            gst::FlowError::Flushing
+        } else {
+            gst::FlowError::Error
+        })
+    );
+    assert_eq!(
+        bus.pop_filtered(&[gst::MessageType::Error]).is_none(),
+        cancel
+    );
+    let observed = !sink.imp().track_lock().tracks_failed;
+    assert_eq!(observed, cancel);
+    let observed = sink.imp().namespace.lock().unwrap().is_some();
+    assert_eq!(observed, cancel);
+    if cancel {
+        assert!(flush_observed.load(Ordering::SeqCst));
+        thread.join().unwrap();
+        sink.imp().set_pad_flush(&peer, false);
+        control().connect_result = None;
+        assert_eq!(src.push(keyframe(gst::ClockTime::ZERO, 64)), OK);
+        assert_eq!(log_count(Op::Write), 1);
+    }
+    let _ = sink.set_state(gst::State::Null);
+    close_source(src);
+}
+
+#[test]
+fn flush_racing_connect_error_is_retryable() {
+    connect_error_with_flush(true);
+}
+#[test]
+fn actual_connect_error_is_reported() {
+    connect_error_with_flush(false);
+}
+
+#[test]
+fn cmaf_avc_sample_entries_are_signaled_exactly() {
+    let _suite = suite();
+    for entry in [b"avc1", b"avc3"] {
+        for protected in [false, true] {
+            let (sink, _null_sink) = new_sink();
+            if protected {
+                sink.set_property("drm-systems", WIDEVINE_UUID);
+            }
+            let index = control().added_cfgs.len();
+            assert_eq!(
+                push_cmaf_init_entry(&sink, protected, b"cenc", 0, entry),
+                OK
+            );
+            let cfg = observe_control(|c| c.added_cfgs.clone())[index].clone();
+            let expected = format!("{}.42e01e", std::str::from_utf8(entry).unwrap());
+            assert_eq!(cfg.codec, expected);
+            assert_eq!(
+                cfg.init_data.as_deref(),
+                Some(
+                    build_cmaf_init_entry(
+                        90000,
+                        1920,
+                        1080,
+                        protected,
+                        b"cenc",
+                        &FIXTURE_KID,
+                        entry
+                    )
+                    .as_slice()
+                )
+            );
+            assert_eq!(!cfg.cp_ref_ids.is_empty(), protected);
+        }
+    }
+}
+
+#[test]
+fn protected_avc3_without_drm_is_refused_before_connect() {
+    let _suite = suite();
+    let (sink, _null_sink) = new_sink();
+    assert_eq!(
+        push_cmaf_init_entry(&sink, true, b"cenc", 0, b"avc3"),
+        Err(gst::FlowError::Error)
+    );
+    assert_eq!(log_count(Op::Connect), 0);
+    assert_eq!(log_count(Op::Write), 0);
+}
+
+fn null_cleanup_on_return_or_panic(panic: bool) {
+    let _suite = suite();
+    let saved_sink = Mutex::new(None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (sink, _null_sink) = new_sink();
+        assert!(sink.set_state(gst::State::Paused).is_ok());
+        let src = open_src_pad(&sink, "video", "cleanup-proof", video_caps());
+        assert_eq!(src.push(keyframe(gst::ClockTime::ZERO, 64)), OK);
+        *saved_sink.lock().unwrap() = Some(sink.clone());
+        close_source(src);
+        // This panic occurs in ordinary Rust after all Gst/FFI calls return.
+        if panic {
+            panic!("controlled fixture NULL cleanup panic");
+        }
+    }));
+    assert_eq!(result.is_err(), panic);
+    if let Err(payload) = result {
+        let message = payload.downcast_ref::<&str>().copied();
+        assert_eq!(message, Some("controlled fixture NULL cleanup panic"));
+    }
+    let sink = saved_sink.lock().unwrap().take();
+    let sink = sink.expect("fixture created");
+    assert_eq!(sink.current_state(), gst::State::Null);
+    assert_eq!(observe_control(|c| c.destroys), 1);
+    assert_eq!(log_count(Op::DestroySender), 1);
+}
+
+#[test]
+fn null_cleanup_precedes_serial_release_on_return() {
+    null_cleanup_on_return_or_panic(false);
+}
+
+#[test]
+fn null_cleanup_precedes_serial_release_on_panic() {
+    null_cleanup_on_return_or_panic(true);
+}
+
+#[test]
+fn held_push_worker_settles_before_serial_release_on_panic() {
+    let _suite = suite();
+    let (sink, _null_sink) = new_sink();
+    assert!(sink.set_state(gst::State::Paused).is_ok());
+    let src = open_src_pad(&sink, "video", "held-worker-cleanup", video_caps());
+    control().hold_attach = true;
+    let mut saved_job = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (job, _worker) = PushJob::start(&src, keyframe(gst::ClockTime::ZERO, 64));
+        wait_attach_entered();
+        saved_job = Some(job);
+        // The real fixture worker is now blocked inside attach. Only this
+        // ordinary Rust controller unwinds; no panic crosses a Gst callback.
+        panic!("controlled held-worker cleanup panic");
+    }));
+    let payload = result.expect_err("controlled worker-owner panic");
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("controlled held-worker cleanup panic")
+    );
+    let job = saved_job.expect("worker entered attach");
+    let (done, returned) = {
+        let state = job.state.lock().unwrap();
+        (state.done, state.ret.is_some())
+    };
+    assert!(done && returned);
+    assert_eq!(sink.current_state(), gst::State::Null);
+    assert_eq!(observe_control(|c| c.destroys), 1);
+    assert_eq!(log_count(Op::DestroySender), 1);
+    close_source(src);
 }

@@ -1,61 +1,48 @@
-//! Media payloads handed to libmoq without copying.
+//! Copy application-owned media into binding-owned storage before handoff.
 //!
-//! libmoq takes a payload as a refcounted buffer (`moq_rcbuf_t`) and releases
-//! it when the last reference goes. A GStreamer buffer is already mapped
-//! readable by the time we send it, so the bytes can be lent to libmoq as they
-//! are and the mapping dropped from libmoq's release callback. That keeps one
-//! access unit per object off the memcpy path, which is what `moqsink` relied
-//! on when `moq5` still offered an owner-generic constructor
-//! (`RcBuf::from_owner_range`).
-//!
-//! `moq5::Buffer` now adopts only `Vec` and `Box<[u8]>`, so an owner of any
-//! other type goes through its `wrap_raw` escape hatch. This module is the
-//! only place in the plugin that uses `unsafe`, and the whole of it is the two
-//! obligations `wrap_raw` documents: the bytes stay valid and unmodified until
-//! the release callback runs, and the callback runs exactly once.
-
-use std::ffi::c_void;
-use std::ops::Range;
+//! Gst memory may run an application destructor when its last mapping drops.
+//! It must be released here, never from the native network-thread callback.
 
 use moq5::{Buffer, Error, Result};
+use std::ops::Range;
 
-/// Drops the owner `wrap` boxed. libmoq calls this once, with the context
-/// `wrap` passed, when the last reference to the buffer goes.
-///
-/// # Safety
-/// `context` must be the `Box<T>` raw pointer `wrap` installed, unreleased.
-unsafe extern "C" fn release<T>(context: *mut c_void, _data: *const u8, _len: usize) {
-    // SAFETY: the caller's contract: our own Box, released exactly once.
-    drop(unsafe { Box::from_raw(context as *mut T) });
+pub(crate) fn copy_owner<T: AsRef<[u8]>>(owner: T, range: Range<usize>) -> Result<Buffer> {
+    let bytes = owner.as_ref().get(range).ok_or(Error::INVAL)?;
+    Buffer::copy_from(bytes)
 }
 
-/// Lend `range` of `owner`'s bytes to libmoq, keeping `owner` alive until the
-/// buffer is released. The bytes are not copied.
-///
-/// `owner` must deref to the same bytes for its whole life -- true of a mapped
-/// GStreamer buffer, which is read-only while mapped. It must be `Send`
-/// because libmoq releases the buffer from whichever thread drops the last
-/// reference, which is not the one that sent it.
-pub(crate) fn wrap_owner<T>(owner: T, range: Range<usize>) -> Result<Buffer>
-where
-    T: AsRef<[u8]> + Send + 'static,
-{
-    let owner = Box::new(owner);
-    let bytes = owner.as_ref().as_ref();
-    if range.start > range.end || range.end > bytes.len() {
-        return Err(Error::INVAL);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    struct Owner(Arc<Mutex<Vec<std::thread::ThreadId>>>, [u8; 4]);
+    impl AsRef<[u8]> for Owner {
+        fn as_ref(&self) -> &[u8] {
+            &self.1
+        }
     }
-    let len = range.end - range.start;
-    let data = bytes[range].as_ptr();
-    let context = Box::into_raw(owner);
-    // SAFETY: `data`/`len` address `context`'s own bytes, which live until the
-    // release callback drops it; the box is leaked to libmoq until then. The
-    // callback is ours, runs once per libmoq's contract, and frees exactly
-    // that box. On failure libmoq has not taken the context, so we drop it.
-    let wrapped = unsafe { Buffer::wrap_raw(data, len, Some(release::<T>), context as *mut c_void) };
-    if wrapped.is_err() {
-        // SAFETY: the pointer Box::into_raw gave us, never released.
-        drop(unsafe { Box::from_raw(context) });
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            // Models application reentry on release; no native callback may run it.
+            self.0.lock().unwrap().push(std::thread::current().id());
+        }
     }
-    wrapped
+    #[test]
+    fn gst_owner_released_before_native_handoff() {
+        gst::init().unwrap();
+        for remote_release in [false, true] {
+            let drops = Arc::new(Mutex::new(Vec::new()));
+            let buffer = gst::Buffer::from_slice(Owner(drops.clone(), [1, 2, 3, 4]));
+            let mapped = buffer.into_mapped_buffer_readable().unwrap();
+            let copied = copy_owner(mapped, 1..3).unwrap();
+            assert_eq!(&*drops.lock().unwrap(), &[std::thread::current().id()]);
+            assert_eq!(copied.as_slice(), &[2, 3]);
+            if remote_release {
+                std::thread::spawn(move || drop(copied)).join().unwrap();
+            } else {
+                drop(copied);
+            }
+            assert_eq!(drops.lock().unwrap().len(), 1);
+        }
+    }
 }

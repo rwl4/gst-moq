@@ -2,7 +2,8 @@
 
 use moq5::cmaf::{CodecKind, InitInfo};
 
-/// MSF codec string for a parsed CMAF init segment: "avc1.PPCCLL",
+/// MSF codec string for a parsed CMAF init segment: "avc1.PPCCLL" or
+/// "avc3.PPCCLL",
 /// "mp4a.40.<aot>" or "opus". `None` for codecs this plugin does not publish
 /// (HEVC, AV1) or when the codec config is too short to read.
 pub fn codec_string_from_init(info: InitInfo<'_>) -> Option<String> {
@@ -13,7 +14,13 @@ pub fn codec_string_from_init(info: InitInfo<'_>) -> Option<String> {
             if d.len() < 4 || d[0] != 1 {
                 return None;
             }
-            Some(format!("avc1.{:02x}{:02x}{:02x}", d[1], d[2], d[3]))
+            let entry = info.sample_entry()?;
+            let prefix = match &entry {
+                b"avc1" => "avc1",
+                b"avc3" => "avc3",
+                _ => return None,
+            };
+            Some(format!("{prefix}.{:02x}{:02x}{:02x}", d[1], d[2], d[3]))
         }
         CodecKind::Aac => codec_string_from_aac_asc(d),
         CodecKind::Opus => Some("opus".into()),
@@ -73,7 +80,12 @@ mod tests {
 
     fn info(kind: moq_cmaf_codec_kind_t, config: &[u8]) -> moq_cmaf_init_info_t {
         let mut i = moq_cmaf_init_info_t::default();
-        unsafe { moq_cmaf_init_info_init(&mut i) };
+        unsafe {
+            moq_cmaf_init_info_init_sized(&mut i, std::mem::size_of::<moq_cmaf_init_info_t>())
+        };
+        if kind == MOQ_CMAF_CODEC_AVC {
+            i.sample_entry = u32::from_be_bytes(*b"avc1");
+        }
         i.codec_kind = kind;
         i.codec_config = span(config);
         i
@@ -85,6 +97,25 @@ mod tests {
         let avcc = [1, 0x42, 0xc0, 0x1e, 0xff, 0xe1];
         let i = info(MOQ_CMAF_CODEC_AVC, &avcc);
         assert_eq!(codec_of(&i).as_deref(), Some("avc1.42c01e"));
+    }
+
+    #[test]
+    fn avc_entry_identity_is_required_and_preserved() {
+        let avcc = [1, 0x42, 0xc0, 0x1e];
+        for (entry, expected) in [
+            (*b"avc1", Some("avc1.42c01e")),
+            (*b"avc3", Some("avc3.42c01e")),
+            (*b"zzzz", None),
+            ([0; 4], None),
+        ] {
+            let mut i = info(MOQ_CMAF_CODEC_AVC, &avcc);
+            i.sample_entry = u32::from_be_bytes(entry);
+            assert_eq!(codec_of(&i).as_deref(), expected);
+        }
+        let mut old = info(MOQ_CMAF_CODEC_AVC, &avcc);
+        old.struct_size = u32::try_from(std::mem::offset_of!(moq_cmaf_init_info_t, sample_entry))
+            .expect("CMAF field offset fits the record stamp");
+        assert_eq!(codec_of(&old), None);
     }
 
     #[test]

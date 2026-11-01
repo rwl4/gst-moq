@@ -37,11 +37,12 @@ use gst_base::prelude::*;
 use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use moq5::sys::{MOQ_DONE, MOQ_ERR_CLOSED, MOQ_ERR_INTERRUPTED, MOQ_OK};
-use moq5::{Error, Namespace, Packaging, TerminalReason, TrackEventKind};
+use moq5::{DeliveryOrigin, Error, Namespace, Packaging, TerminalReason, TrackEventKind};
 
 use crate::service::{Desc, Endpoint, Receiver, ReceiverCfg, Track};
 
@@ -59,12 +60,13 @@ const DEFAULT_NAMESPACE: &str = "example";
 const DEFAULT_TRACK_NAME: &str = "video";
 const WAIT_TIMEOUT_US: u64 = 100 * 1000;
 const DEFAULT_LATENCY_MS: u32 = 200;
-/// browsers (playa) default to draft-16; 0 = offer all
-const DEFAULT_DRAFT: u32 = 16;
+/// Native AUTO prefers draft 22, then 18, then 16, with backend filtering.
+const DEFAULT_DRAFT: u32 = 0;
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u32 = 10000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Settings {
+    auth: crate::auth::Settings,
     pub(crate) host: String,
     pub(crate) port: u32,
     pub(crate) relay_path: String,
@@ -81,6 +83,7 @@ pub(crate) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            auth: crate::auth::Settings::default(),
             host: DEFAULT_HOST.into(),
             port: DEFAULT_PORT,
             relay_path: DEFAULT_RELAY_PATH.into(),
@@ -103,6 +106,9 @@ pub(crate) struct State {
     pub(crate) want_track: Option<Track>,
     pub(crate) want_track_ended: bool,
     pub(crate) selection_failed: bool,
+    /// A selected generation can fail while other receiver tracks remain live.
+    /// Preserve already accepted objects before reporting its terminal error.
+    pub(crate) track_failure: Option<(u32, Option<Error>)>,
     pub(crate) started: bool,
     pub(crate) caps_pushed: bool,
     pub(crate) catalog_ready: bool,
@@ -139,6 +145,7 @@ pub struct MoqSrc {
     /// The endpoint, outside `state` so unlock() can interrupt a create()
     /// that is blocked in a receiver wait while holding the state lock.
     pub(crate) ep: Mutex<Option<Endpoint>>,
+    interrupted: AtomicBool,
 }
 
 fn lossy(b: &[u8]) -> String {
@@ -179,7 +186,11 @@ impl MoqSrc {
     }
 
     /// Map a LOC presentation time onto this pipeline's running time.
-    fn map_pts(&self, st: &mut State, loc_us: u64) -> gst::ClockTime {
+    pub(super) fn map_pts(
+        &self,
+        st: &mut State,
+        loc_us: u64,
+    ) -> Result<gst::ClockTime, gst::FlowError> {
         if !st.have_anchor {
             let obj = self.obj();
             let mut now = None;
@@ -202,14 +213,33 @@ impl MoqSrc {
                 st.anchor_running
             );
         }
-        if loc_us >= st.anchor_loc_us {
-            return st.anchor_running + gst::ClockTime::from_useconds(loc_us - st.anchor_loc_us);
+        let running_ns = st.anchor_running.nseconds();
+        let pts_ns = if loc_us >= st.anchor_loc_us {
+            (loc_us - st.anchor_loc_us)
+                .checked_mul(1000)
+                .and_then(|delta| running_ns.checked_add(delta))
+                .filter(|pts| *pts < u64::MAX)
+        } else {
+            // An arbitrarily early timestamp clamps to zero; no oversized
+            // ClockTime intermediate is needed to establish that result.
+            Some(
+                (st.anchor_loc_us - loc_us)
+                    .checked_mul(1000)
+                    .and_then(|back| running_ns.checked_sub(back))
+                    .unwrap_or(0),
+            )
+        };
+        match pts_ns {
+            Some(pts) => Ok(gst::ClockTime::from_nseconds(pts)),
+            None => {
+                gst::element_error!(
+                    self.obj(),
+                    gst::StreamError::Format,
+                    ("LOC presentation time cannot be represented in pipeline time")
+                );
+                Err(gst::FlowError::Error)
+            }
         }
-        // Earlier than the anchor (reordered / late object): clamp.
-        let back = gst::ClockTime::from_useconds(st.anchor_loc_us - loc_us);
-        st.anchor_running
-            .checked_sub(back)
-            .unwrap_or(gst::ClockTime::ZERO)
     }
 
     /// Drain pending track-discovery events. Logs catalog discovery and binds
@@ -222,17 +252,46 @@ impl MoqSrc {
         let Some(receiver) = st.receiver.as_ref() else {
             return;
         };
-        while let Ok(Some(ev)) = receiver.poll_track() {
+        loop {
+            let ev = match receiver.poll_track() {
+                Ok(Some(event)) => event,
+                Ok(None) | Err(Error::INTERRUPTED) | Err(Error::CLOSED) => break,
+                Err(error) => {
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::Read,
+                        ("could not poll media track events (rc={})", error.code())
+                    );
+                    st.selection_failed = true;
+                    break;
+                }
+            };
             match ev.kind() {
                 TrackEventKind::Added => {
-                    let d = ev.description().ok().flatten();
+                    let d = match ev.description() {
+                        Ok(description) => description,
+                        Err(error) => {
+                            gst::element_imp_error!(
+                                self,
+                                gst::ResourceError::Read,
+                                (
+                                    "could not read media track description (rc={})",
+                                    error.code()
+                                )
+                            );
+                            st.selection_failed = true;
+                            break;
+                        }
+                    };
                     gst::info!(
                         CAT,
                         imp = self,
                         "TRACK_ADDED name={} codec={} packaging={}",
                         d.as_ref().map(|d| lossy(d.name())).unwrap_or_default(),
                         d.as_ref().map(|d| lossy(d.codec())).unwrap_or_default(),
-                        if d.as_ref().is_some_and(|d| d.packaging() == Some(Packaging::Cmaf)) {
+                        if d.as_ref()
+                            .is_some_and(|d| d.packaging() == Some(Packaging::Cmaf))
+                        {
                             "cmaf"
                         } else {
                             "loc"
@@ -247,9 +306,7 @@ impl MoqSrc {
                             seen.push_str(&lossy(d.name()));
                         }
                     }
-                    if !d.has_name()
-                        || st.want_track.is_some()
-                        || d.name() != track_name.as_bytes()
+                    if !d.has_name() || st.want_track.is_some() || d.name() != track_name.as_bytes()
                     {
                         continue;
                     }
@@ -325,19 +382,38 @@ impl MoqSrc {
                         }
                     }
                 }
-                TrackEventKind::Ended | TrackEventKind::Removed => {
-                    if ev.track().is_some() && ev.track() == st.want_track {
-                        st.want_track_ended = true;
+                TrackEventKind::Ended | TrackEventKind::Removed
+                    if ev.track().is_some() && ev.track() == st.want_track =>
+                {
+                    st.want_track_ended = true;
+                    gst::info!(
+                        CAT,
+                        imp = self,
+                        "selected-track terminal event kind={} name={}",
+                        ev.raw_kind(),
+                        track_name
+                    );
+                    // Handles and descriptors remain stable until receiver
+                    // teardown. Preserve CMAF init and pending/queued tails
+                    // after removal too.
+                }
+                TrackEventKind::LocalFailure
+                | TrackEventKind::UpdateLocalFailure
+                | TrackEventKind::DeliveryLocalFailure
+                    if ev.track().is_some() && ev.track() == st.want_track =>
+                {
+                    if ev.kind() == TrackEventKind::DeliveryLocalFailure
+                        && ev.delivery_origin() == Some(DeliveryOrigin::Fill)
+                    {
                         gst::info!(
                             CAT,
                             imp = self,
-                            "selected-track terminal event kind={} name={}",
+                            "selected-track fill failed kind={} rc={:?}; live delivery continues",
                             ev.raw_kind(),
-                            track_name
+                            ev.local_result()
                         );
-                        // Handles and descriptors remain stable until receiver
-                        // teardown. Preserve CMAF init and pending/queued tails
-                        // after removal too.
+                    } else {
+                        st.track_failure = Some((ev.raw_kind(), ev.local_result()));
                     }
                 }
                 TrackEventKind::CatalogReady => {
@@ -393,6 +469,10 @@ impl MoqSrc {
         let mut st = self.lock_state();
         let st = &mut *st;
 
+        if self.interrupted.load(Ordering::Acquire) {
+            return Err(gst::FlowError::Flushing);
+        }
+
         if let Some(pending) = st.pending.take() {
             // fragment queued behind the init
             return Ok(pending);
@@ -404,6 +484,9 @@ impl MoqSrc {
         };
 
         loop {
+            if self.interrupted.load(Ordering::Acquire) {
+                return Err(gst::FlowError::Flushing);
+            }
             self.drain_track_events(st);
 
             if st.negotiation_failed || st.selection_failed {
@@ -416,7 +499,14 @@ impl MoqSrc {
                     _ => st.derived_caps.clone(),
                 };
                 if let Some(effective) = effective {
-                    let _ = self.obj().set_caps(&effective);
+                    // CAPS is sticky: event delivery alone can report success
+                    // after storing an event that the peer will not negotiate.
+                    if !self.obj().src_pad().peer_query_accept_caps(&effective) {
+                        return Err(gst::FlowError::NotNegotiated);
+                    }
+                    self.obj()
+                        .set_caps(&effective)
+                        .map_err(|_| gst::FlowError::NotNegotiated)?;
                     st.caps_pushed = true;
                 }
             }
@@ -433,6 +523,16 @@ impl MoqSrc {
 
             if rc == MOQ_ERR_INTERRUPTED {
                 return Err(gst::FlowError::Flushing);
+            }
+            if let Err(error) = &polled {
+                if *error != Error::CLOSED {
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::Read,
+                        ("could not poll media object (rc={})", error.code())
+                    );
+                    return Err(gst::FlowError::Error);
+                }
             }
 
             if st.want_track.is_none()
@@ -527,7 +627,7 @@ impl MoqSrc {
                 }
                 let mut buf = gst::Buffer::from_slice(obj.payload().to_vec());
                 {
-                    let pts = self.map_pts(st, obj.presentation_time_us());
+                    let pts = self.map_pts(st, obj.presentation_time_us())?;
                     let b = buf.get_mut().unwrap();
                     b.set_pts(pts);
                     if !obj.is_keyframe() {
@@ -568,6 +668,22 @@ impl MoqSrc {
                 return Err(gst::FlowError::Error);
             }
 
+            if rc == MOQ_DONE || rc == MOQ_ERR_CLOSED {
+                if let Some((kind, error)) = st.track_failure {
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::Read,
+                        (
+                            "selected track \"{}\" failed locally (event={}, rc={:?})",
+                            track_name,
+                            kind,
+                            error
+                        )
+                    );
+                    return Err(gst::FlowError::Error);
+                }
+            }
+
             if rc == MOQ_ERR_CLOSED {
                 gst::info!(CAT, imp = self, "endpoint closed; sending EOS");
                 return Err(gst::FlowError::Eos);
@@ -583,9 +699,18 @@ impl MoqSrc {
                 return Err(gst::FlowError::Eos);
             }
 
-            // Nothing queued. WaitResult for the next wakeup.
-            if receiver.wait(Duration::from_micros(WAIT_TIMEOUT_US)) == Err(Error::INTERRUPTED) {
-                return Err(gst::FlowError::Flushing);
+            // Nothing queued. Wait for the next wakeup.
+            match receiver.wait(Duration::from_micros(WAIT_TIMEOUT_US)) {
+                Err(Error::INTERRUPTED) => return Err(gst::FlowError::Flushing),
+                Ok(_) | Err(Error::CLOSED) => {}
+                Err(error) => {
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::Read,
+                        ("could not wait for media (rc={})", error.code())
+                    );
+                    return Err(gst::FlowError::Error);
+                }
             }
             // Ready (woke) / TimedOut / CLOSED: loop; the next poll classifies
             // terminal vs more data deterministically.
@@ -609,81 +734,97 @@ impl ObjectSubclass for MoqSrc {
 impl ObjectImpl for MoqSrc {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
-            vec![
-                glib::ParamSpecString::builder("host")
-                    .nick("Host")
-                    .blurb("MoQ relay host to connect to")
-                    .default_value(Some(DEFAULT_HOST))
-                    .build(),
-                glib::ParamSpecUInt::builder("port")
-                    .nick("Port")
-                    .blurb("MoQ relay UDP/QUIC port")
-                    .minimum(1)
-                    .maximum(65535)
-                    .default_value(DEFAULT_PORT)
-                    .build(),
-                glib::ParamSpecString::builder("relay-path")
-                    .nick("Relay path")
-                    .blurb("WebTransport endpoint path on the relay")
-                    .default_value(Some(DEFAULT_RELAY_PATH))
-                    .build(),
-                glib::ParamSpecBoolean::builder("insecure")
-                    .nick("Insecure")
-                    .blurb("Skip TLS verification (demo/test only)")
-                    .default_value(false)
-                    .build(),
-                glib::ParamSpecString::builder("namespace")
-                    .nick("Track namespace")
-                    .blurb("Slash-separated MoQ track namespace")
-                    .default_value(Some(DEFAULT_NAMESPACE))
-                    .build(),
-                glib::ParamSpecString::builder("track-name")
-                    .nick("Track name")
-                    .blurb("MoQ track name to deliver (matched against the catalog)")
-                    .default_value(Some(DEFAULT_TRACK_NAME))
-                    .build(),
-                glib::ParamSpecBoxed::builder::<gst::Caps>("caps")
-                    .nick("Caps")
-                    .blurb(
-                        "Output caps describing the subscribed track's media (optional; \
+            Vec::from(crate::auth::properties())
+                .into_iter()
+                .chain(vec![
+                    glib::ParamSpecString::builder("host")
+                        .nick("Host")
+                        .blurb("MoQ relay host to connect to")
+                        .default_value(Some(DEFAULT_HOST))
+                        .build(),
+                    glib::ParamSpecUInt::builder("port")
+                        .nick("Port")
+                        .blurb("MoQ relay UDP/QUIC port")
+                        .minimum(1)
+                        .maximum(65535)
+                        .default_value(DEFAULT_PORT)
+                        .build(),
+                    glib::ParamSpecString::builder("relay-path")
+                        .nick("Relay path")
+                        .blurb("WebTransport endpoint path on the relay")
+                        .default_value(Some(DEFAULT_RELAY_PATH))
+                        .build(),
+                    glib::ParamSpecBoolean::builder("insecure")
+                        .nick("Insecure")
+                        .blurb("Skip TLS verification (demo/test only)")
+                        .default_value(false)
+                        .build(),
+                    glib::ParamSpecString::builder("namespace")
+                        .nick("Track namespace")
+                        .blurb("Slash-separated MoQ track namespace")
+                        .default_value(Some(DEFAULT_NAMESPACE))
+                        .build(),
+                    glib::ParamSpecString::builder("track-name")
+                        .nick("Track name")
+                        .blurb("MoQ track name to deliver (matched against the catalog)")
+                        .default_value(Some(DEFAULT_TRACK_NAME))
+                        .build(),
+                    glib::ParamSpecBoxed::builder::<gst::Caps>("caps")
+                        .nick("Caps")
+                        .blurb(
+                            "Output caps describing the subscribed track's media (optional; \
                          derived from the catalog when unset)",
-                    )
-                    .build(),
-                glib::ParamSpecUInt::builder("latency")
-                    .nick("Latency")
-                    .blurb("Latency reported to the pipeline (ms) to absorb network jitter")
-                    .minimum(0)
-                    .maximum(10000)
-                    .default_value(DEFAULT_LATENCY_MS)
-                    .build(),
-                glib::ParamSpecUInt::builder("draft")
-                    .nick("MoQT draft")
-                    .blurb(
-                        "MoQ Transport draft version to negotiate (16 or 18); \
-                         0 offers every draft libmoq supports",
-                    )
-                    .minimum(0)
-                    .maximum(18)
-                    .default_value(DEFAULT_DRAFT)
-                    .build(),
-                glib::ParamSpecUInt::builder("discovery-timeout")
-                    .nick("Discovery timeout")
-                    .blurb(
-                        "Fail if the track is not announced within this many ms \
+                        )
+                        .build(),
+                    glib::ParamSpecUInt::builder("latency")
+                        .nick("Latency")
+                        .blurb("Latency reported to the pipeline (ms) to absorb network jitter")
+                        .minimum(0)
+                        .maximum(10000)
+                        .default_value(DEFAULT_LATENCY_MS)
+                        .build(),
+                    glib::ParamSpecUInt::builder("draft")
+                        .nick("MoQT draft")
+                        .blurb(
+                            "MoQ Transport draft version to negotiate (16, 18 or 22); \
+                         0 negotiates supported drafts newest first (22, 18, 16)",
+                        )
+                        .minimum(0)
+                        .maximum(22)
+                        .default_value(DEFAULT_DRAFT)
+                        .build(),
+                    glib::ParamSpecUInt::builder("discovery-timeout")
+                        .nick("Discovery timeout")
+                        .blurb(
+                            "Fail if the track is not announced within this many ms \
                          (0 fails immediately)",
-                    )
-                    .minimum(0)
-                    .maximum(600000)
-                    .default_value(DEFAULT_DISCOVERY_TIMEOUT_MS)
-                    .build(),
-            ]
+                        )
+                        .minimum(0)
+                        .maximum(600000)
+                        .default_value(DEFAULT_DISCOVERY_TIMEOUT_MS)
+                        .build(),
+                ])
+                .collect()
         });
         PROPS.as_ref()
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         let mut s = self.settings.lock().unwrap();
+        if matches!(pspec.name(), "setup-auth-token" | "setup-auth-token-type")
+            && !crate::auth::can_mutate(self.obj().as_ref())
+        {
+            drop(s);
+            gst::error!(
+                CAT,
+                imp = self,
+                "SETUP authorization properties require NULL or READY state"
+            );
+            return;
+        }
         match pspec.name() {
+            "setup-auth-token" => s.auth.encoded = value.get().unwrap(),
+            "setup-auth-token-type" => s.auth.token_type = value.get().unwrap(),
             "host" => s.host = value.get::<Option<String>>().unwrap().unwrap_or_default(),
             "port" => s.port = value.get().unwrap(),
             "relay-path" => {
@@ -705,6 +846,7 @@ impl ObjectImpl for MoqSrc {
     fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
         let s = self.settings.lock().unwrap();
         match pspec.name() {
+            "setup-auth-token-type" => s.auth.token_type.to_value(),
             "host" => s.host.to_value(),
             "port" => s.port.to_value(),
             "relay-path" => s.relay_path.to_value(),
@@ -758,6 +900,8 @@ impl ElementImpl for MoqSrc {
 
 impl BaseSrcImpl for MoqSrc {
     fn start(&self) -> Result<(), gst::ErrorMessage> {
+        #[cfg(test)]
+        crate::auth::interleave::before_start();
         let s = self.settings.lock().unwrap().clone();
         let namespace = Namespace::parse(&s.namespace).map_err(|e| {
             gst::error!(CAT, imp = self, "{}", e);
@@ -770,6 +914,7 @@ impl BaseSrcImpl for MoqSrc {
         st.want_track = None;
         st.want_track_ended = false;
         st.selection_failed = false;
+        st.track_failure = None;
         st.caps_pushed = false;
         st.catalog_ready = false;
         st.objects_recv = 0;
@@ -784,7 +929,12 @@ impl BaseSrcImpl for MoqSrc {
         st.discover_deadline = clock::monotonic_us() + s.discovery_timeout_ms as i64 * 1000;
 
         let url = relay_url(&s.host, s.port, &s.relay_path);
-        let ep = match Endpoint::connect(&endpoint_config(&url, s.insecure, s.draft)) {
+        let mut cfg = endpoint_config(&url, s.insecure, s.draft);
+        cfg.setup_auth = s
+            .auth
+            .decode()
+            .map_err(|reason| gst::error_msg!(gst::ResourceError::Settings, ("{}", reason)))?;
+        let ep = match Endpoint::connect(&cfg) {
             Ok(ep) => ep,
             Err(e) => {
                 Self::clear_session(&mut st);
@@ -864,6 +1014,7 @@ impl BaseSrcImpl for MoqSrc {
     }
 
     fn unlock(&self) -> Result<(), gst::ErrorMessage> {
+        self.interrupted.store(true, Ordering::Release);
         if let Some(ep) = self.ep.lock().unwrap().as_ref() {
             ep.set_interrupted(true);
         }
@@ -871,13 +1022,12 @@ impl BaseSrcImpl for MoqSrc {
     }
 
     fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
+        // Discard stale queued output before allowing create to resume.
+        self.lock_state().pending = None;
         if let Some(ep) = self.ep.lock().unwrap().as_ref() {
             ep.set_interrupted(false);
         }
-        // A fragment queued behind an init segment before the flush is now
-        // stale (its track/init state may no longer match); drop it instead
-        // of pushing it out after the flush completes.
-        self.lock_state().pending = None;
+        self.interrupted.store(false, Ordering::Release);
         Ok(())
     }
 

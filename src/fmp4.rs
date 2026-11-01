@@ -48,6 +48,8 @@ pub struct Splitter {
     /// accumulating ftyp + moov
     init: Vec<u8>,
     init_emitted: bool,
+    /// A prior init was emitted; survives an abandoned replacement init.
+    has_emitted_init: bool,
     /// pending moof waiting for its mdat
     pub(crate) moof: Option<Vec<u8>>,
     /// largest single box accepted
@@ -84,6 +86,7 @@ impl Splitter {
             buf: Vec::new(),
             init: Vec::new(),
             init_emitted: false,
+            has_emitted_init: false,
             moof: None,
             max_box,
             out: VecDeque::new(),
@@ -111,6 +114,15 @@ impl Splitter {
     /// A partial box or a moof still waiting for its mdat.
     pub fn has_partial(&self) -> bool {
         !self.buf.is_empty() || self.moof.is_some()
+    }
+
+    /// Abandon old-segment input while preserving an already emitted init.
+    pub fn flush(&mut self) {
+        self.buf.clear();
+        self.moof = None;
+        self.out.clear();
+        self.init.clear();
+        self.init_emitted = self.has_emitted_init;
     }
 
     fn emit(&mut self, kind: Kind, data: Vec<u8>) {
@@ -164,6 +176,7 @@ impl Splitter {
                         let init = self.init.clone();
                         self.emit(Kind::Init, init);
                         self.init_emitted = true;
+                        self.has_emitted_init = true;
                     }
                     let mut moof = Vec::with_capacity(size);
                     moof.extend_from_slice(&self.buf[..size]);
@@ -219,6 +232,39 @@ mod tests {
             bx(b"mdat", &p1),
         ]
         .concat()
+    }
+
+    #[test]
+    fn flush_discards_partial_and_pending_input() {
+        for abandoned in [
+            vec![0, 0, 0],
+            bx(b"moof", &[9]),
+            bx(b"ftyp", &[9]),
+            [bx(b"ftyp", &[9]), bx(b"moov", &[9])].concat(),
+        ] {
+            let mut s = Splitter::new(1024);
+            s.push(
+                &[
+                    bx(b"ftyp", &[0]),
+                    bx(b"moov", &[0]),
+                    bx(b"moof", &[1]),
+                    bx(b"mdat", &[2]),
+                ]
+                .concat(),
+            )
+            .unwrap();
+            assert_eq!(s.pull().unwrap().kind, Kind::Init);
+            s.push(&abandoned).unwrap();
+            s.flush();
+            assert!(!s.has_partial());
+            assert!(s.pull().is_none());
+            let fresh = [bx(b"moof", &[3]), bx(b"mdat", &[4])].concat();
+            s.push(&fresh).unwrap();
+            let unit = s.pull().unwrap();
+            assert_eq!(unit.kind, Kind::Fragment);
+            assert_eq!(unit.data, fresh);
+            assert!(s.pull().is_none());
+        }
     }
 
     #[test]

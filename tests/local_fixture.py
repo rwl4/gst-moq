@@ -220,7 +220,9 @@ def publisher(root, manifest, host, port, path, draft=16):
         source.set_property("caps", Gst.Caps.from_string(caps))
         source.set_property("format", Gst.Format.TIME)
         pipeline.add(source)
-        target = sink.get_static_pad("sink") if i == 0 else sink.request_pad_simple("audio_%u")
+        target = sink.get_static_pad("video") if i == 0 else sink.request_pad_simple("audio_%u")
+        if target is None:
+            raise RuntimeError("publisher could not obtain its video/audio pads")
         if i:
             target.set_property("track-name", NAMES[i])
         if source.get_static_pad("src").link(target) != Gst.PadLinkReturn.OK:

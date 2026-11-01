@@ -1,270 +1,126 @@
 # gst-moq
 
-GStreamer elements for [Media over QUIC Transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/),
-backed by [MOQ5](https://github.com/openmoq/moq5) through its high-level media
-service tier.
+**Media over QUIC for GStreamer.**
 
-- **`moqsink`** — publish a GStreamer stream to a MoQ relay.
-- **`moqsrc`** — subscribe to a MoQ track and inject it into a pipeline.
+Publish live audio and video to a MoQ relay, or bring a remote track into
+your pipeline. gst-moq is written in Rust and uses
+[MOQ5](https://github.com/openmoq/moq5) for connections, catalogs and media
+delivery. Encoding, decoding and playback stay in GStreamer.
 
-## Design
+| Element | What it does |
+| --- | --- |
+| `moqsink` | Publishes one or more tracks under a shared catalog. |
+| `moqsrc` | Discovers a catalog and receives the track you select. |
 
-- Thin adapters over the MOQ5 **service tier** (`moq_endpoint_t` +
-  `moq_media_sender_t` / `moq_media_receiver_t`). MOQ5 owns the network thread,
-  version negotiation, TLS, and the MSF catalog; the elements only translate
-  GstBuffers ⇄ MoQ media objects.
-- WebTransport client to a relay (the service tier is client-only — there is no
-  peer-to-peer mode).
-- H.264 byte-stream carried as LOC-01 media objects: a keyframe opens a MoQ
-  group, delta frames extend it, timestamps are stream-relative.
+[Build guide](docs/building.md)
+· [Pipelines and properties](docs/usage.md)
+· [Compatibility](docs/compatibility.md)
 
 ## Build
 
-The plugin is written in Rust on [gstreamer-rs](https://gitlab.freedesktop.org/gstreamer/gstreamer-rs).
-It requires Rust 1.92 or newer, the GStreamer 1.x development packages
-(`gstreamer-1.0`, `gstreamer-base-1.0`, 1.22 or newer), libclang (the
-`moq5-sys` crate generates its libmoq bindings with bindgen), and an installed
-MOQ5 with the service component (`libmoq-service`).
+You need Rust 1.92+, GStreamer 1.22+ development packages, `pkg-config`,
+libclang, and an installed MOQ5 SDK with its managed PicoQUIC WebTransport
+backend.
+The SDK must match the MOQ5 revision pinned in [Cargo.toml](Cargo.toml).
+The [build guide](docs/building.md) covers that setup and the current native
+SDK requirements.
 
-The plugin talks to libmoq through the `moq5` crate, a safe Rust API over
-libmoq's service tier, which sits on the raw `moq5-sys` bindings. Both live
-in the MOQ5 repository under `bindings/rust`; `Cargo.toml` pins the commit.
-That commit binds the libmoq API of upstream MOQ5 `main` (draft 22), so the
-installed MOQ5 must be built from a matching checkout.
-
-`moq5-sys` links the static libmoq archives from `$MOQ_PREFIX/lib` and reads
-the headers from `$MOQ_PREFIX/include`. `.cargo/config.toml` sets
-`MOQ_PREFIX` to `../local-prefix` next to this repository -- where MOQ5's
-`install` preset puts it -- unless the environment already sets it. On Linux
-the plugin is a shared object, so every static library it links must be
-built position-independent:
+From this repository, with the SDK installed:
 
 ```sh
-cd ../moq5
-cmake --preset install -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-cmake --build build/install && cmake --install build/install
-```
-
-If your libmoq build references further static libraries (picoquic, picotls,
-OpenSSL), name them in `MOQ_EXTRA_LIBS` (space-separated
-`cargo:rustc-link-lib` values, e.g.
-`"static=picoquic-core static=picotls-core ssl crypto"`); they are searched in
-the same `lib` directory.
-
-```sh
-cargo build --release                 # MOQ_PREFIX=<moq5-prefix> for another install
-export GST_PLUGIN_PATH="$PWD/target/release"
+export MOQ_PREFIX=/path/to/moq5-prefix
+cargo build --release --locked
+export GST_PLUGIN_PATH="$PWD/target/release${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
 gst-inspect-1.0 moqsink
 gst-inspect-1.0 moqsrc
 ```
 
-## Test
+Export `MOQ_PREFIX` for both builds and tests, selecting the SDK built from
+this repository's pinned MOQ5 revision. See the [build guide](docs/building.md)
+for installing it into a separate, durable prefix.
 
-```sh
-cargo test
-```
+## Publish video
 
-runs, with no relay and no sockets (the `moq5` crate's own tests run in the
-MOQ5 repository):
-
-- unit tests for the fMP4 splitter and the codec strings;
-- the element suites (`moqsink` track barrier and content protection,
-  `moqsink` EOS/flush recovery, `moqsrc` delivery), which drive the real
-  element code against a test double for the service (`src/service/fake.rs`).
-  Both elements reach libmoq through `src/service`, a small boundary over the
-  `moq5` crate: a release build compiles `service::real`, which forwards each
-  call inline, and a test build compiles the double, which records what the
-  element asked for. Picking the implementation at compile time keeps the
-  release path free of dynamic dispatch, and leaves the double unable to
-  notice libmoq itself changing -- that is what the e2e suite is for;
-- `tests/smoke.sh` against a freshly built plugin (inspection, a CMAF publish
-  pipeline against a refused relay, a `moqsink` state cycle), plus its
-  socket-free guard tests in `tests/test_smoke_guards.py`.
-
-`cargo run --bin inspect_cmaf_fixture -- file.mp4` prints the init/fragment
-inventory of a fragmented MP4 as the plugin splits and libmoq parses it.
-
-## Usage
-
-Publish a stream to a relay:
+Replace `RELAY`, the port and the path with your relay's settings. These
+examples negotiate draft 22, then 18, then 16, and require the named GStreamer
+encoders, parsers and decoders. TLS certificate verification is enabled.
 
 ```sh
 gst-launch-1.0 -e \
-  videotestsrc ! x264enc tune=zerolatency key-int-max=30 ! h264parse \
+  videotestsrc is-live=true ! video/x-raw,framerate=30/1 \
+  ! x264enc tune=zerolatency key-int-max=30 ! h264parse config-interval=-1 \
   ! video/x-h264,stream-format=byte-stream,alignment=au \
-  ! moqsink host=RELAY port=4433 relay-path=/moq-relay namespace=example track-name=video
+  ! moqsink host=RELAY port=4433 relay-path=/moq-relay \
+      namespace=example track-name=video draft=0
 ```
 
-Subscribe, decode, and display:
+## Receive and play
+
+Each `moqsrc` receives one track. Use multiple source elements to receive
+audio and video together. Use the same namespace, track name and draft as
+the publisher:
 
 ```sh
 gst-launch-1.0 \
-  moqsrc host=RELAY port=4433 relay-path=/moq-relay namespace=example track-name=video \
-    caps="video/x-h264,stream-format=byte-stream,alignment=au" \
+  moqsrc host=RELAY port=4433 relay-path=/moq-relay \
+    namespace=example track-name=video draft=0 \
   ! h264parse ! avdec_h264 ! autovideosink
 ```
 
-Use `h264parse config-interval=-1` so every keyframe carries SPS/PPS: `moqsink`
-adds the track on the first keyframe and publishes the SPS/PPS as an avcC
-`initData` in the catalog (WebCodecs players need the decoder description),
-together with a `codec` string derived from the SPS profile/level and the
-width, height and framerate from the caps.
+`moqsrc` derives H.264 Annex B and AAC caps from the catalog. See the
+[pipeline guide](docs/usage.md) for audio, CMAF, explicit caps and multiple
+tracks. `moqsink` is a plain `GstElement`: PAUSED does not suspend publishing.
 
-Common properties: `host`, `port`, `relay-path`, `namespace`, `track-name`,
-`insecure` (skip TLS verification — test only), `draft` (MoQ Transport draft to
-negotiate, default 16; 0 offers every draft libmoq supports). `moqsink` adds
-`codec` (override the derived catalog codec string), `bitrate`, `sync`,
-`sap-timeline` and `max-fragment-size`; `moqsrc` adds `discovery-timeout`,
-`latency` (ms reported through the LATENCY query so synced sinks absorb
-network jitter instead of dropping late frames; default 200) and `caps`,
-which is optional for CMAF, AAC-LC LOC and H.264 LOC — it is derived from the catalog
-when omitted. Automatic H.264 LOC caps describe Annex B access units;
-length-prefixed payloads and catalog-only decoder configuration are not yet
-handled automatically; for length-prefixed AVC, supply explicit `video/x-h264,
-stream-format=avc,alignment=au` caps including the matching `codec_data`.
-Other LOC codecs require explicit compatible caps.
+## Media support
 
-`moqsink` is a plain `GstElement`, not a `GstBaseSink`: it does not preroll,
-so `READY` to `PAUSED` returns immediately instead of waiting for the first
-buffer, and `PAUSED` does not pause publishing — buffers already queued keep
-going out to the relay until the pipeline reaches `NULL` or the source stops
-delivering them. Only `sync` is exposed; the other `GstBaseSink` properties
-(`async`, `qos`, `max-lateness`, `ts-offset`, `blocksize`,
-`enable-last-sample`, `render-delay`) do not exist on this element.
+| Input to `moqsink` | Pad | Packaging |
+| --- | --- | --- |
+| H.264 Annex B access units | `video` | LOC |
+| Raw AAC-LC access units | `audio` | LOC |
+| Fragmented MP4 video or audio | `video_%u`, `audio_%u` | CMAF with a CMSF-01 catalog |
 
-`moqsrc` maps LOC presentation times onto the pipeline clock: the first object
-is anchored at the running time of its arrival and later objects keep their
-offset from it, so synced sinks play at the publisher's cadence.
+The plugin connects to relays over WebTransport. The default `draft=0` offers
+MoQT 22, 18 and 16 in that preference order. Set `draft=22`, `draft=18` or
+`draft=16` to require a specific version.
 
-Keep `draft` the same on the publisher and on every subscriber. Relays that
-bridge draft-16 and draft-18 sessions have been seen to forward the LOC
-property block verbatim, and the two drafts encode its integers differently
-(QUIC varint vs vi64), so a cross-draft subscriber rejects the objects.
+gst-moq is pre-1.0. See the
+[compatibility notes](docs/compatibility.md) for codec, relay and backend limits.
 
-### LOC with audio
+## Authenticated relays
 
-The always pads are `video` (H.264 byte-stream) and `audio` (raw AAC access
-units). Each publishes a LOC-01 track into the same catalog, so a LOC broadcast
-can carry video and audio:
+Both elements accept a write-only `setup-auth-token` property containing the
+token payload as canonical padded Base64. `setup-auth-token-type` defaults to
+`1`, the CAT4MOQ type. Set credentials programmatically before PAUSED to keep
+them out of shell history and process listings.
+
+Catalog-driven receive needs permission for both the catalog and the selected
+media track. See [authentication](docs/usage.md#authentication) for scope,
+validation, lifecycle and the distinction between SETUP and request credentials.
+
+## Development
+
+With the build dependencies installed:
 
 ```sh
-gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace=example \
-  videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse config-interval=-1 \
-    ! video/x-h264,stream-format=byte-stream,alignment=au ! ms.video \
-  audiotestsrc is-live=true ! voaacenc ! aacparse \
-    ! audio/mpeg,mpegversion=4,stream-format=raw ! ms.audio
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
 
-The audio pad wants **raw** AAC, not ADTS: the decoder config travels in the
-catalog's `initData`, taken from the caps' `codec_data`, exactly as the video
-pad publishes avcC there. `rate` and `channels` become the catalog's
-`samplerate` and `channelConfig`, which MSF-01 §5.2.28/§5.2.29 make mandatory
-for an audio track — the element reads them from the caps and falls back to the
-AudioSpecificConfig. Every AAC frame is a sync point, so objects are never
-dropped waiting for a keyframe; groups are cut on a one-second budget rather
-than one per frame, matching the video GOP cadence. The element's `track-name`
-and `bitrate` properties apply to the video pad; the audio pad carries its own
-(`ms.audio::track-name=...`), defaulting to `audio`.
+Tests run without an external relay. Unit tests use a service test double;
+smoke tests load the plugin and check cleanup against an unavailable loopback
+destination. They do not replace live interoperability tests. The
+[build guide](docs/building.md#tests) lists their additional dependencies.
 
-Play it back with `moqsrc`, which derives AAC caps from the catalog:
+If something breaks, [open an issue](https://github.com/rwl4/gst-moq/issues)
+with your pipeline, GStreamer and MOQ5 versions, relay, protocol draft and
+relevant logs. Keep credentials out of reports.
 
-```sh
-gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=audio \
-  ! aacparse ! avdec_aac ! autoaudiosink
-```
+## Contributors
 
-### CMAF (fragmented MP4) with audio
+Created and maintained by Raymond Lucke, with contributions from the
+[Red5](https://www.red5.net/) team and our
+[contributors](https://github.com/rwl4/gst-moq/graphs/contributors).
+The Rust port was contributed by Vitor Azevedo.
 
-`moqsink` also takes fragmented MP4 on request pads `video_%u` and `audio_%u`
-and publishes each as a CMAF track under one CMSF-01 catalog (`packaging:
-"cmaf"`, root `initDataList`, per-track `initRef`). Feed each pad from its own
-fragmented muxer; one moof+mdat fragment becomes one MoQ object, and a
-fragment starting on a sync sample opens a new group, so keep
-`fragment-duration` a multiple of the GOP length.
-
-```sh
-gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace=example \
-  videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse \
-    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.video_0 \
-  audiotestsrc is-live=true ! voaacenc ! aacparse \
-    ! mp4mux fragment-duration=1000 fragment-mode=dash-or-mss ! ms.audio_0
-```
-
-Opus works the same way (`opusenc ! opusparse ! mp4mux ...`). Pad properties
-`track-name` and `bitrate` set the catalog entry per pad (`ms.video_0::track-name=hd`).
-Element property `sap-timeline` adds a CMSF SAP event timeline track per CMAF track.
-
-Play a CMAF track back with `qtdemux`; `caps` is derived from the catalog:
-
-```sh
-gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=video \
-  ! qtdemux ! h264parse ! avdec_h264 ! autovideosink
-gst-launch-1.0 moqsrc host=RELAY port=4433 relay-path=/moq namespace=example track-name=audio \
-  ! qtdemux ! aacparse ! avdec_aac ! autoaudiosink
-```
-
-## Status
-
-The plugin supports H.264 Annex B LOC publishing, LOC AAC audio on a second
-always pad, and CMAF video/audio under a CMSF-01 catalog. CMAF codec strings
-cover AVC, AAC and Opus; automatic LOC receiver caps cover H.264 and AAC.
-Finite draft-16 LOC plus CMAF/AAC delivery, independent track EOS and publisher
-drain passed through the Chicago and London moqx relays with the exact private
-SDK described below. Separately captured CMAF AVC/AAC from Playa decoded
-offline. LOC video-plus-audio publishing, and `moqsrc` decoding the audio track
-back, were validated against `moq-relay.red5.net` on draft-16 only. These
-results do not qualify arbitrary LOC framing, Opus playback, draft-18 finite
-EOS or every relay implementation. A raw-QUIC (`moqt://`) transport option is a
-follow-up.
-
-## Author
-
-Raymond Lucke and the Red5 Team
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).
-
-Publisher EOS uses one three-second acceptance/drain budget and requires MOQ5's
-service-aware endpoint drain. Failure or cancellation posts an error rather than
-successful EOS; local flush does not prove peer receipt or decode. Released pads
-retain their native end obligations until sender teardown. FLUSH_STOP does not
-reopen an ended track. Returning through READY creates a fresh sender lifetime.
-
-The local fixture in `tests/local_fixture.py` generates independent LOC access
-units and CMAF init/fragments, pins their SHA256 inventory, and validates output
-through an offline appsrc/appsink replay. Its `plan` command constructs one
-publisher and both receivers at NULL without connecting. `publish`/`receive`
-require explicit traffic authorization and accept `--draft 16` or `--draft 18`,
-with draft16 as the default,
-TLS verification and a fresh per-run readiness directory. Priming media is part
-of the inventory; the counted suffix waits for real receiver priming receipts.
-Public TRACK_ENDED evidence distinguishes service end from local timeout/close,
-but the native event also covers rejection and is not wire-marker provenance.
-
-The EOS contract requires MOQ5's service-aware endpoint drain. The tested SDK is
-a private delivery based on f9e20ebf with additional native changes, not a
-released MOQ5 package; older transport-only drain implementations are insufficient.
-Consumers must supply a MOQ5 SDK with these service-drain guarantees; a public
-minimum revision has not yet been established. Relay catalog bootstrap support
-is a separate requirement for playback against a given relay.
-
-
-LOC audio publishing accepts AAC-LC with a supported two-byte
-AudioSpecificConfig, an indexed sample rate and an explicit channel configuration.
-The config must agree with any rate/channels in caps. HE-AAC, explicit-frequency
-core dependencies, extension/trailing config and program-config-element forms are rejected rather than guessed. This
-restriction applies to LOC publishing, not the existing CMAF codec-string support.
-
-Publishing connects after every linked pad has prepared its first track. Put
-queues before pads fed by a common upstream streaming task. `catalog-wait-ms`
-(default 3000) bounds that wait: an incomplete track set reports an error and
-opens no connection. Initial attach/add runs in one MOQ5 endpoint task before
-the first sender pump, so it cannot publish a partial initial catalog. Link all
-publishing pads before the first buffer; restart through READY to change the
-initial stream set. Empty streams finish without opening a connection.
-`catalog-refresh-ms` defaults to zero; opt into refresh only for relay cache
-compatibility. Capture timestamps use each pad's segment running time so encoder
-PTS offsets do not shift audio against video. Audio group boundaries follow
-observed video keyframe boundaries, with `loc-audio-group-ms` as an upper bound;
-this does not guarantee simultaneous delivery by the relay.
+Licensed under [Apache-2.0](LICENSE).

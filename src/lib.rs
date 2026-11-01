@@ -5,14 +5,18 @@
 
 use gst::glib;
 
+#[cfg(test)]
+mod auth_tests;
+
+mod auth;
 mod clock;
 pub mod codec;
 pub mod fmp4;
 pub mod moq;
 pub mod moqsink;
 pub mod moqsrc;
-mod service;
 mod payload;
+mod service;
 
 #[cfg(test)]
 mod test_support;
@@ -37,8 +41,8 @@ gst::plugin_define!(
     env!("CARGO_PKG_DESCRIPTION"),
     plugin_init,
     env!("CARGO_PKG_VERSION"),
-    "Apache-2.0",
+    "Apache 2.0",
     "gst-moq",
     "gst-moq",
-    "https://github.com/openmoq/moq5"
+    env!("CARGO_PKG_REPOSITORY")
 );

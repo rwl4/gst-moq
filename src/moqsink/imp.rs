@@ -4,7 +4,7 @@
 //! One element owns one endpoint and one media sender, so every pad's track
 //! lands in a single MSF/CMSF catalog. Pads:
 //!
-//!   sink       (always)  H.264 Annex B access units -> LOC objects. The
+//!   video      (always)  H.264 Annex B access units -> LOC objects. The
 //!                        track is added on the first keyframe so the catalog
 //!                        carries an avcC initData and an SPS-derived codec.
 //!   audio      (always)  raw AAC access units -> LOC objects.
@@ -13,9 +13,10 @@
 //!
 //! The service tier owns the network thread, version negotiation, the sticky
 //! catalog and the bounded per-track send queues; chain functions only
-//! translate buffers into media objects. Sender::write() takes the
-//! payload on success and libmoq drops our buffer reference when it releases
-//! it (on the network thread).
+//! translate buffers into media objects. LOC copies the mapped Gst payload
+//! into binding-owned storage and releases the mapping on the calling thread;
+//! CMAF transfers an owned fragment vector. Sender::write() takes the payload
+//! on success, and native release owns only that binding storage.
 //!
 //! Sync: with sync=true (default) each chain waits on the pipeline clock for
 //! the buffer's running time plus the configured latency, so non-live
@@ -61,8 +62,8 @@ use moq5::sys::{
     MOQ_ERR_WOULD_BLOCK, MOQ_ERR_WRONG_STATE, MOQ_OK,
 };
 use moq5::{
-    Buffer, CmsfUrl, ContentProtection, DrmSystem, MediaType, Namespace, Packaging, SapType,
-    SendObject, WaitResult,
+    Buffer, CmsfUrl, ContentProtection, DrmSystem, MediaType, Namespace, Packaging, SendObject,
+    WaitResult,
 };
 
 use crate::service::{Endpoint, SendTrack, Sender, SenderCfg, TrackCfg};
@@ -82,8 +83,8 @@ const DEFAULT_PORT: u32 = 4443;
 const DEFAULT_RELAY_PATH: &str = "/moq-relay";
 const DEFAULT_NAMESPACE: &str = "example";
 const DEFAULT_TRACK_NAME: &str = "video";
-/// browsers (playa) default to draft-16; 0 = offer all
-const DEFAULT_DRAFT: u32 = 16;
+/// Native AUTO prefers draft 22, then 18, then 16, with backend filtering.
+const DEFAULT_DRAFT: u32 = 0;
 /// catalog max bitrate (MSF-01 5.2.22)
 const DEFAULT_BITRATE: u64 = 2_000_000;
 const DEFAULT_AUDIO_BITRATE: u64 = 128_000;
@@ -96,7 +97,7 @@ const DEFAULT_AUDIO_TRACK_NAME: &str = "audio";
 const LOC_AUDIO_GROUP_US: u32 = 1_000_000;
 const DEFAULT_MAX_FRAGMENT: u64 = 16 << 20;
 /// How long the first pad to produce a track waits for the remaining LINKED
-/// pads to produce theirs before the sender is attached anyway. It bounds the
+/// pads to produce theirs before startup fails. It bounds the
 /// case where a pad is linked but never delivers (a silent or absent
 /// elementary stream that also never sends EOS); a pad that EOSes or flushes
 /// drops out of the barrier immediately, so the normal cost is the gap
@@ -105,10 +106,41 @@ const DEFAULT_CATALOG_WAIT_MS: u32 = 3000;
 
 pub(crate) const EOS_DRAIN_TIMEOUT_US: i64 = 3 * 1_000_000;
 
+/// Registration and peer readiness share this unchanged local budget.
+const STARTUP_TIMEOUT_US: i64 = 3 * 1_000_000;
+
+#[derive(Clone, Copy, Debug)]
+enum StartupPhase {
+    Connect,
+    Registration,
+    Readiness,
+}
+impl StartupPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Registration => "registration",
+            Self::Readiness => "readiness",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+enum StartupFailure {
+    Native {
+        phase: StartupPhase,
+        code: moq_result_t,
+    },
+    Deadline {
+        phase: StartupPhase,
+    },
+    Cancelled,
+}
+
 type Flow = Result<gst::FlowSuccess, gst::FlowError>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Settings {
+    auth: crate::auth::Settings,
     host: String,
     port: u32,
     relay_path: String,
@@ -136,6 +168,7 @@ pub(crate) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            auth: crate::auth::Settings::default(),
             host: DEFAULT_HOST.into(),
             port: DEFAULT_PORT,
             relay_path: DEFAULT_RELAY_PATH.into(),
@@ -162,6 +195,7 @@ pub(crate) struct ObjState {
     /// concurrent FLUSH_START/STOP pads
     pub(crate) flush_count: i32,
     pub(crate) state_flushing: bool,
+    pub(crate) flush_generation: u64,
     /// Endpoint publication and removal share this lock (and `send`); no
     /// callback can touch a freed endpoint.
     pub(crate) ep: Option<Endpoint>,
@@ -188,6 +222,7 @@ impl Default for ObjState {
             latency: gst::ClockTime::ZERO,
             flush_count: 0,
             state_flushing: false,
+            flush_generation: 0,
             ep: None,
             eos_posted: false,
             loc_anchored: false,
@@ -246,6 +281,8 @@ pub(crate) struct TrackState {
     pub(crate) preparing_tracks: Option<Vec<(MoqSinkPad, TrackCfg)>>,
     pub(crate) tracks_committed: bool,
     pub(crate) tracks_failed: bool,
+    /// An emitted startup error owns this generation's abandoned CMAF tail.
+    startup_aborted_generation: Option<u64>,
     /// CMSF 4.1.1 root contentProtections authored for this session, built at
     /// the barrier (build_content_protections) from every protected CMAF
     /// pad's init segment crossed with drm-systems. libmoq deep-copies them at
@@ -296,6 +333,31 @@ fn eos_drain(ep: &Endpoint, deadline: i64) -> moq_result_t {
             Ok(WaitResult::Ready) => MOQ_OK,
             Ok(WaitResult::TimedOut) => MOQ_DONE,
             Err(e) => e.code(),
+        },
+    }
+}
+
+/// All track ends have been admitted and writer/add gates are closed.
+/// Completion is asynchronous: drain its terminal catalog work, then check
+/// the sticky failure which output-flush success alone cannot report.
+fn eos_complete(ep: &Endpoint, sender: &Sender, deadline: i64) -> moq_result_t {
+    if eos_remaining(deadline) == 0 {
+        return MOQ_DONE;
+    }
+    let result = rc(&sender.complete());
+    if result != MOQ_OK {
+        return result;
+    }
+    let result = eos_drain(ep, deadline);
+    if result != MOQ_OK {
+        return result;
+    }
+    match sender.stats() {
+        Err(error) => error.code(),
+        Ok(stats) => match stats.completion_error {
+            Some(error) => error.code(),
+            None if eos_remaining(deadline) == 0 => MOQ_DONE,
+            None => MOQ_OK,
         },
     }
 }
@@ -456,7 +518,10 @@ impl MoqSink {
         self.settings.lock().unwrap().clone()
     }
     fn notify_tracks(&self) {
-        let _g = self.track_lock();
+        let mut tracks = self.track_lock();
+        if tracks.startup_aborted_generation != Some(self.obj_lock().flush_generation) {
+            tracks.startup_aborted_generation = None;
+        }
         self.track_cond.notify_all();
     }
 
@@ -526,7 +591,7 @@ impl MoqSink {
                 return Err(gst::FlowError::Eos);
             }
             match pad.track() {
-                Some(track) => sender.write(track, obj).map_err(|e| e.error.code()),
+                Some(track) => sender.write(track, obj).map_err(|e| e.code()),
                 None => Err(MOQ_ERR_INVAL),
             }
         };
@@ -581,7 +646,7 @@ impl MoqSink {
 
     // -- clock sync ----------------------------------------------------------
 
-    /// WaitResult until the buffer's running time when sync is on. Returns FLUSHING
+    /// Wait until the buffer's running time when sync is on. Returns FLUSHING
     /// if the wait was unscheduled by a flush or state change.
     fn sync(&self, pad: &MoqSinkPad, ts: Option<gst::ClockTime>) -> Flow {
         if !self.settings.lock().unwrap().sync {
@@ -658,6 +723,9 @@ impl MoqSink {
             let mut st = self.obj_lock();
             if pad.flush_pending() != pending {
                 st.flush_count += if pending { 1 } else { -1 };
+                if pending {
+                    st.flush_generation += 1;
+                }
                 pad.set_flush_pending(pending);
             }
             pad.set_flushing(pending || st.state_flushing);
@@ -711,12 +779,7 @@ impl MoqSink {
 
     /// Defer the track to the sender startup task while committing, or add
     /// it to the running sender.
-    fn register_track(
-        &self,
-        ts: &mut TrackState,
-        pad: &MoqSinkPad,
-        cfg: TrackCfg,
-    ) -> moq_result_t {
+    fn register_track(&self, ts: &mut TrackState, pad: &MoqSinkPad, cfg: TrackCfg) -> moq_result_t {
         if let Some(prep) = ts.preparing_tracks.as_mut() {
             prep.push((pad.clone(), cfg));
             return MOQ_OK;
@@ -915,8 +978,8 @@ impl MoqSink {
     /// Attach the sender and add every prepared track to it. Caller holds the
     /// track lock, which keeps this to one pass and keeps the add_track calls
     /// together.
-    pub(crate) fn commit_tracks(&self, ts: &mut TrackState) {
-        if ts.tracks_committed || ts.tracks_failed {
+    pub(crate) fn commit_tracks(&self, ts: &mut TrackState, generation: u64) {
+        if ts.tracks_committed || ts.tracks_failed || self.startup_cancelled(generation) {
             return;
         }
 
@@ -931,12 +994,18 @@ impl MoqSink {
         // the tracks as clear while the objects are encrypted. Safe this
         // early: it needs only each pad's parsed init_info, which
         // prepare_cmaf_track filled before the barrier released.
-        self.build_content_protections(ts);
+        if !self.build_content_protections(ts, generation) {
+            ts.tracks_failed = !self.startup_cancelled(generation);
+            ts.preparing_tracks = None;
+            self.track_cond.notify_all();
+            return;
+        }
 
+        gst::debug!(CAT, imp = self, "preparing initial track snapshot");
         let pads = self.sink_pads();
         let (mut any, mut failed) = (false, false);
         for p in &pads {
-            if failed {
+            if failed || self.startup_cancelled(generation) {
                 break;
             }
             if !p.pend_ready() || p.track().is_some() || self.pad_cancelled(p) {
@@ -957,21 +1026,41 @@ impl MoqSink {
             }
         }
 
-        if failed || !any || !self.open_sender(ts) {
+        if self.startup_cancelled(generation) {
+            // Preparation is still valid; this attempt belongs to an old segment.
+        } else if failed || !any {
             ts.tracks_failed = true;
         } else {
-            ts.tracks_committed = true;
+            match self.open_sender(ts, generation) {
+                Ok(()) => ts.tracks_committed = true,
+                Err(gst::FlowError::Flushing) => (),
+                Err(_) => ts.tracks_failed = true,
+            }
         }
         ts.preparing_tracks = None;
         self.track_cond.notify_all();
     }
 
-    /// WaitResult for all linked pads, then create one immutable track snapshot.
+    /// Wait for all linked pads, then create one immutable track snapshot.
     /// The public endpoint task attaches/adds that snapshot in one managed
     /// turn before sender hooks run. Failure to prepare a linked stream is an
     /// error, never a successful partial catalog. Put queues on branches
     /// sharing an upstream task.
-    pub(crate) fn await_tracks(&self, pad: &MoqSinkPad) -> bool {
+    fn startup_cancelled(&self, generation: u64) -> bool {
+        let st = self.obj_lock();
+        st.flush_generation != generation || st.state_flushing || st.flush_count > 0
+    }
+
+    pub(crate) fn await_tracks(&self, pad: &MoqSinkPad) -> Result<(), gst::FlowError> {
+        let generation = self.obj_lock().flush_generation;
+        self.await_tracks_generation(pad, generation)
+    }
+
+    pub(crate) fn await_tracks_generation(
+        &self,
+        pad: &MoqSinkPad,
+        generation: u64,
+    ) -> Result<(), gst::FlowError> {
         let catalog_wait_ms = self.settings.lock().unwrap().catalog_wait_ms;
         let mut ts = self.track_lock();
         pad.set_pend_ready(true);
@@ -979,14 +1068,14 @@ impl MoqSink {
 
         let deadline = clock::monotonic_us() + catalog_wait_ms as i64 * 1000;
         while !ts.tracks_committed && !ts.tracks_failed {
-            if self.pad_cancelled(pad) {
+            if self.pad_cancelled(pad) || self.startup_cancelled(generation) {
                 break;
             }
             if self.tracks_ready() {
-                self.commit_tracks(&mut ts);
+                self.commit_tracks(&mut ts, generation);
                 break;
             }
-            if self.pad_cancelled(pad) {
+            if self.pad_cancelled(pad) || self.startup_cancelled(generation) {
                 break;
             }
             gst::debug!(CAT, imp = self, "waiting for linked track set");
@@ -1002,7 +1091,7 @@ impl MoqSink {
                 res.timed_out()
             };
             if timed_out {
-                if self.pad_cancelled(pad) {
+                if self.pad_cancelled(pad) || self.startup_cancelled(generation) {
                     break;
                 }
                 ts.tracks_failed = true;
@@ -1019,7 +1108,7 @@ impl MoqSink {
         if ts.tracks_committed
             && pad.track().is_none()
             && pad.pend_ready()
-            && !self.pad_cancelled(pad)
+            && !(self.pad_cancelled(pad) || self.startup_cancelled(generation))
         {
             gst::element_imp_error!(
                 self,
@@ -1029,7 +1118,13 @@ impl MoqSink {
             );
         }
 
-        ts.tracks_committed && pad.track().is_some()
+        if self.pad_cancelled(pad) || self.startup_cancelled(generation) {
+            Err(gst::FlowError::Flushing)
+        } else if ts.tracks_committed && pad.track().is_some() {
+            Ok(())
+        } else {
+            Err(gst::FlowError::Error)
+        }
     }
 
     fn chain_loc(&self, pad: &MoqSinkPad, buffer: gst::Buffer) -> Flow {
@@ -1067,13 +1162,7 @@ impl MoqSink {
                 return Err(gst::FlowError::Error);
             }
             // Attaches the sender once every linked pad has a track.
-            if !self.await_tracks(pad) {
-                return Err(if self.pad_cancelled(pad) {
-                    gst::FlowError::Flushing
-                } else {
-                    gst::FlowError::Error
-                });
-            }
+            self.await_tracks(pad)?;
         }
 
         let (fatal, fatal_code) = match self.send_lock().sender.as_ref() {
@@ -1114,10 +1203,10 @@ impl MoqSink {
             loc_skip_leading_aud(frame.as_slice())
         };
         let len = frame.len() - skip;
-        // Zero-copy: libmoq drops the mapped buffer when it releases the
-        // payload.
+        // Release application-owned Gst memory on this calling thread.
+        // Only binding-owned byte storage crosses into native service work.
         let end = frame.len();
-        let payload = match crate::payload::wrap_owner(frame, skip..end) {
+        let payload = match crate::payload::copy_owner(frame, skip..end) {
             Ok(p) => p,
             Err(_) => {
                 gst::element_imp_error!(self, gst::ResourceError::Write, ("rcbuf wrap failed"));
@@ -1242,7 +1331,7 @@ impl MoqSink {
                 self,
                 gst::StreamError::CodecNotFound,
                 (
-                    "unsupported codec in CMAF init segment on pad {} (libmoq kind {}); this plugin publishes avc1, mp4a and opus",
+                    "unsupported codec in CMAF init segment on pad {} (libmoq kind {}); this plugin publishes avc1, avc3, mp4a and opus",
                     pad.name(),
                     codec_kind.code()
                 )
@@ -1303,7 +1392,9 @@ impl MoqSink {
             .timescale(info.timescale())
             .init_data(init.data());
         if sap_timeline {
-            tc = tc.sap_timeline(0);
+            gst::element_imp_error!(self, gst::ResourceError::Settings,
+                ("CMAF SAP timelines require exact SAP classification, which this input does not provide"));
+            return Err(gst::FlowError::Error);
         }
         // CMSF 4.1.2: declaring these ids tells a subscriber the track is
         // encrypted, and libmoq cross-checks that every id resolves to a root
@@ -1420,11 +1511,14 @@ impl MoqSink {
             }
         };
 
-        // CMAF timing lives in the fragment, so no properties.
+        // Timeline publication is refused at registration: fragment timing alone
+        // cannot establish exact SAP classification. Ordinary CMAF objects
+        // carry their timing in the fragment.
         let o = SendObject {
             is_sync: sync,
             starts_group: sync,
-            sap_type: sync.then_some(SapType::Type1),
+            // Sync flags establish group eligibility, not exact SAP-1/2.
+            sap_type: None,
             ..SendObject::new(payload)
         };
         self.write_object(pad, o, len)
@@ -1491,18 +1585,17 @@ impl MoqSink {
                         // and travel in the sender cfg, so the parse has to
                         // precede the attach (build_content_protections).
                         ret = Err(gst::FlowError::Error);
-                    } else if !self.await_tracks(pad) {
-                        // Attaches the sender once every linked pad has its
-                        // init segment, so the initial catalog carries them
-                        // all.
-                        ret = Err(if pad.flushing() || !self.started() {
-                            gst::FlowError::Flushing
-                        } else {
-                            gst::FlowError::Error
-                        });
+                    } else if let Err(error) = self.await_tracks(pad) {
+                        ret = Err(error);
                     }
                 }
                 fmp4::Kind::Fragment => {
+                    // A cancelled startup retains its validated init; FLUSH_STOP
+                    // discards the abandoned fragments, so retry on fresh media.
+                    let prepared = pad.state().init.is_some();
+                    if pad.track().is_none() && prepared {
+                        self.await_tracks(pad)?;
+                    }
                     if pad.track().is_none() {
                         gst::element_imp_error!(
                             self,
@@ -1606,7 +1699,7 @@ impl MoqSink {
             self,
             gst::ResourceError::Write,
             ("publisher EOS failed or aborted (rc={})", rc),
-            ["Local service/stream flush did not complete; teardown may discard the tail"]
+            ["Broadcast completion or local service/stream flush did not complete; teardown may discard the tail"]
         );
     }
 
@@ -1637,7 +1730,7 @@ impl MoqSink {
     /// a sender is published to writers, so no pending task can create output
     /// here.
     fn drain(&self, deadline: i64) -> bool {
-        let rc = {
+        let (rc, started) = {
             let mut guard = self.send_lock();
             let send = &mut *guard;
             let ep = self.obj_lock().ep.clone();
@@ -1659,21 +1752,29 @@ impl MoqSink {
                 }
             }
             if rc == MOQ_OK {
-                if let Some(ep) = ep.as_ref() {
-                    rc = eos_drain(ep, deadline);
+                if let (Some(sender), Some(ep)) = (send.sender.as_ref(), ep.as_ref()) {
+                    rc = eos_complete(ep, sender, deadline);
                 }
             }
-            rc
+            (rc, send.sender.is_some())
         };
         if rc != MOQ_OK {
             self.eos_error(rc);
             return false;
         }
-        gst::info!(
-            CAT,
-            imp = self,
-            "publisher EOS: local service and stream queues flushed"
-        );
+        if started {
+            gst::info!(
+                CAT,
+                imp = self,
+                "publisher EOS: broadcast completion requested; local service and stream queues flushed"
+            );
+        } else {
+            gst::info!(
+                CAT,
+                imp = self,
+                "publisher EOS: empty/unstarted; no broadcast completion requested"
+            );
+        }
         let obj = self.obj();
         let _ = obj.post_message(gst::message::Eos::builder().src(&*obj).build());
         true
@@ -1780,13 +1881,27 @@ impl MoqSink {
             EventView::FlushStart(_) => self.set_pad_flush(pad, true),
             EventView::FlushStop(_) => {
                 self.set_pad_flush(pad, false);
-                pad.state().segment = gst::Segment::new();
+                {
+                    let mut state = pad.state();
+                    state.segment = gst::Segment::new();
+                    state.splitter.flush();
+                }
                 self.retry_ends();
             }
             // GST_EVENT_LATENCY never reaches here: it is flagged UPSTREAM,
             // so sending it to a sink pad is refused before this function
             // runs. It is intercepted in send_event instead.
             EventView::Eos(_) => {
+                let aborted = {
+                    let tracks = self.track_lock();
+                    tracks.startup_aborted_generation == Some(self.obj_lock().flush_generation)
+                        && !tracks.tracks_committed
+                };
+                if aborted && pad.track().is_none() && self.send_lock().sender.is_none() {
+                    // Startup already emitted the primary failure. Its pending
+                    // mux tail is abandoned, not a second independent defect.
+                    return false;
+                }
                 let deadline = clock::monotonic_us() + EOS_DRAIN_TIMEOUT_US;
                 // EOS is serialized with this pad's chain. A buffered partial
                 // box or unpaired moof must not disappear behind a successful
@@ -1826,7 +1941,12 @@ impl MoqSink {
     // -- lifecycle -----------------------------------------------------------
 
     fn start(&self) -> bool {
-        let ns = self.settings.lock().unwrap().namespace.clone();
+        let s = self.settings();
+        if let Err(reason) = s.auth.decode() {
+            gst::element_error!(self.obj(), gst::ResourceError::Settings, ("{}", reason));
+            return false;
+        }
+        let ns = s.namespace;
         match Namespace::parse(&ns) {
             Ok(n) => *self.namespace.lock().unwrap() = Some(n),
             Err(e) => {
@@ -1853,6 +1973,7 @@ impl MoqSink {
             let mut ts = self.track_lock();
             ts.tracks_committed = false;
             ts.tracks_failed = false;
+            ts.startup_aborted_generation = None;
         }
 
         self.started.store(true, Ordering::SeqCst);
@@ -1927,7 +2048,10 @@ impl MoqSink {
     /// is a precondition for this working at all: every pad's init segment
     /// must already be parsed when the refIDs are derived, and the sender cfg
     /// freezes the root entries at attach.
-    fn build_content_protections(&self, ts: &mut TrackState) {
+    fn build_content_protections(&self, ts: &mut TrackState, generation: u64) -> bool {
+        if self.startup_cancelled(generation) {
+            return false;
+        }
         ts.cp_entries.clear();
 
         // Parse drm-systems once per attach.
@@ -1956,6 +2080,9 @@ impl MoqSink {
 
         let mut protected_pads = 0;
         for p in self.sink_pads() {
+            if self.startup_cancelled(generation) {
+                return false;
+            }
             let mut s = p.state();
             s.pend_cp_ref_ids = None;
 
@@ -1975,24 +2102,31 @@ impl MoqSink {
             protected_pads += 1;
 
             let Some(kid) = kid_to_uuid(&default_kid) else {
-                gst::warning!(
-                    CAT,
-                    obj = p,
-                    "encrypted CMAF track with no usable tenc default_KID ({} bytes); publishing it without contentProtections",
-                    default_kid.len()
+                drop(s);
+                if self.startup_cancelled(generation) {
+                    return false;
+                }
+                gst::element_imp_error!(
+                    self,
+                    gst::StreamError::Format,
+                    (
+                        "encrypted CMAF track on pad {} has no usable tenc default_KID ({} bytes)",
+                        p.name(),
+                        default_kid.len()
+                    )
                 );
-                continue;
+                return false;
             };
 
             if systems.is_empty() {
-                gst::warning!(
-                    CAT,
-                    obj = p,
-                    "CMAF track is {}-encrypted (KID {}) but no drm-systems are configured: the catalog will carry no contentProtections and a subscriber has no way to obtain a key",
-                    scheme,
-                    kid
-                );
-                continue;
+                drop(s);
+                if self.startup_cancelled(generation) {
+                    return false;
+                }
+                gst::element_imp_error!(self, gst::ResourceError::Settings,
+                    ("CMAF track on pad {} is {}-encrypted (KID {}), but drm-systems is not configured", p.name(), scheme, kid),
+                    ["CMSF requires protected tracks to reference coherent contentProtections; no connection was opened"]);
+                return false;
             }
 
             let mut refs = Vec::new();
@@ -2030,6 +2164,57 @@ impl MoqSink {
                 "drm-systems is set but no track carries CENC boxes; the catalog will claim no content protection"
             );
         }
+        true
+    }
+
+    /// Called after startup ownership is settled; cancellation takes precedence
+    /// over any native or local failure observed by that abandoned operation.
+    fn fail_startup(
+        &self,
+        ts: &mut TrackState,
+        generation: u64,
+        failure: StartupFailure,
+    ) -> Result<(), gst::FlowError> {
+        {
+            let state = self.obj_lock();
+            if state.flush_generation != generation
+                || state.state_flushing
+                || state.flush_count > 0
+                || matches!(
+                    failure,
+                    StartupFailure::Cancelled
+                        | StartupFailure::Native {
+                            code: MOQ_ERR_INTERRUPTED,
+                            ..
+                        }
+                )
+            {
+                return Err(gst::FlowError::Flushing);
+            }
+            ts.startup_aborted_generation = Some(generation);
+        }
+        match failure {
+            StartupFailure::Deadline { phase } => gst::element_imp_error!(
+                self,
+                gst::ResourceError::OpenWrite,
+                (
+                    "MoQ sender startup deadline expired (phase={})",
+                    phase.name()
+                )
+            ),
+            StartupFailure::Native { phase, code } => gst::element_imp_error!(
+                self,
+                gst::ResourceError::OpenWrite,
+                (
+                    "MoQ sender startup failed (phase={}, rc={})",
+                    phase.name(),
+                    code
+                )
+            ),
+            StartupFailure::Cancelled => unreachable!("cancelled before reporting"),
+        }
+        *self.namespace.lock().unwrap() = None;
+        Err(gst::FlowError::Error)
     }
 
     /// Connect the endpoint and attach the media sender. Deferred out of
@@ -2037,28 +2222,46 @@ impl MoqSink {
     /// before the first sender hook; see await_tracks. A relay that is down
     /// is therefore reported on the first buffer rather than on the state
     /// change. Caller holds the track lock.
-    pub(crate) fn open_sender(&self, ts: &mut TrackState) -> bool {
+    pub(crate) fn open_sender(
+        &self,
+        ts: &mut TrackState,
+        generation: u64,
+    ) -> Result<(), gst::FlowError> {
+        if self.startup_cancelled(generation) {
+            return Err(gst::FlowError::Flushing);
+        }
         let s = self.settings();
         let Some(ns) = self.namespace.lock().unwrap().clone() else {
-            return false;
+            return Err(gst::FlowError::Error);
         };
 
         let url = relay_url(&s.host, s.port, &s.relay_path);
-        let ep = match Endpoint::connect(&endpoint_config(&url, s.insecure, s.draft)) {
+        let mut cfg = endpoint_config(&url, s.insecure, s.draft);
+        cfg.setup_auth = match s.auth.decode() {
+            Ok(token) => token,
+            Err(reason) => {
+                gst::error!(CAT, imp = self, "{}", reason);
+                return self.fail_startup(
+                    ts,
+                    generation,
+                    StartupFailure::Native {
+                        phase: StartupPhase::Connect,
+                        code: moq5::Error::INVAL.code(),
+                    },
+                );
+            }
+        };
+        let ep = match Endpoint::connect(&cfg) {
             Ok(ep) => ep,
             Err(e) => {
-                gst::element_imp_error!(
-                    self,
-                    gst::ResourceError::OpenWrite,
-                    (
-                        "could not open MoQ endpoint to relay {}:{} (rc={})",
-                        s.host,
-                        s.port,
-                        e.code()
-                    )
-                );
-                *self.namespace.lock().unwrap() = None;
-                return false;
+                return self.fail_startup(
+                    ts,
+                    generation,
+                    StartupFailure::Native {
+                        phase: StartupPhase::Connect,
+                        code: e.code(),
+                    },
+                )
             }
         };
 
@@ -2109,81 +2312,90 @@ impl MoqSink {
             .catalog_refresh_interval(Duration::from_millis(s.catalog_refresh_ms as u64))
             .content_protections(cps);
 
-        // Attach, then add every prepared track before the namespace can be
-        // accepted, so the initial catalog carries them all. libmoq publishes
-        // the catalog on acceptance -- a network round trip away -- while
-        // attach and add_track are local calls, so the tracks are in place
-        // first in practice. It is no longer guaranteed by construction: the
-        // posted endpoint task that made it atomic needs moq_endpoint_post,
-        // which the moq5 crate no longer exposes. A track added after
-        // readiness only republishes the catalog, so losing the race costs a
-        // transient one-track catalog, not a wrong one.
+        // One binding-owned managed turn registers the entire snapshot before
+        // the first sender hook. Dropping a pending operation cancels it;
+        // partial registration failure detaches before a hook can publish.
         let (pads, tracks): (Vec<MoqSinkPad>, Vec<TrackCfg>) = ts
             .preparing_tracks
             .take()
             .unwrap_or_default()
             .into_iter()
             .unzip();
-        // Dropping the sender on any early return destroys what was attached,
-        // which is what the startup task's cancel used to settle.
+        // Cancellation settles registration before its endpoint can be dropped.
         let started = (|| {
-            let sender = Sender::attach(&ep, &cfg).map_err(|e| e.code())?;
-            let mut handles = Vec::with_capacity(tracks.len());
-            for track in &tracks {
-                handles.push(sender.add_track(track).map_err(|e| e.code())?);
-            }
-            let deadline = clock::monotonic_us() + EOS_DRAIN_TIMEOUT_US;
+            let deadline = clock::monotonic_us() + STARTUP_TIMEOUT_US;
+            let cancelled = || {
+                let st = self.obj_lock();
+                st.state_flushing || st.flush_count > 0 || st.flush_generation != generation
+            };
+            let mut startup = Sender::attach_with_tracks(&ep, &cfg, &tracks).map_err(|e| {
+                StartupFailure::Native {
+                    phase: StartupPhase::Registration,
+                    code: e.code(),
+                }
+            })?;
+            let (sender, handles) = loop {
+                if cancelled() {
+                    return Err(StartupFailure::Cancelled);
+                }
+                if let Some(result) = startup.poll().map_err(|e| StartupFailure::Native {
+                    phase: StartupPhase::Registration,
+                    code: e.code(),
+                })? {
+                    break result;
+                }
+                let remaining = deadline - clock::monotonic_us();
+                if remaining <= 0 {
+                    return Err(StartupFailure::Deadline {
+                        phase: StartupPhase::Registration,
+                    });
+                }
+                ep.wait(Duration::from_micros(remaining.min(5000) as u64))
+                    .map_err(|e| StartupFailure::Native {
+                        phase: StartupPhase::Registration,
+                        code: e.code(),
+                    })?;
+            };
+            drop(startup);
             let ready_ns = s.namespace.clone();
             while !sender.is_ready() {
-                let cancelled = {
-                    let st = self.obj_lock();
-                    st.state_flushing || st.flush_count > 0
-                };
-                if cancelled {
-                    return Err(MOQ_ERR_INTERRUPTED);
+                if cancelled() {
+                    return Err(StartupFailure::Cancelled);
                 }
                 let now = clock::monotonic_us();
                 if now >= deadline {
-                    return Err(MOQ_DONE);
+                    return Err(StartupFailure::Deadline {
+                        phase: StartupPhase::Readiness,
+                    });
                 }
                 let wait = (deadline - now).clamp(0, 5000) as u64;
                 sender
                     .wait(Duration::from_micros(wait))
-                    .map_err(|e| e.code())?;
+                    .map_err(|e| StartupFailure::Native {
+                        phase: StartupPhase::Readiness,
+                        code: e.code(),
+                    })?;
             }
-            // The readiness record operators look for. libmoq used to deliver
-            // it as a callback; it is polled now, so it is logged once here,
-            // where readiness is first observed.
-            gst::info!(CAT, "native sender ready namespace={}", ready_ns);
+            if cancelled() {
+                return Err(StartupFailure::Cancelled);
+            }
+            // Log the readiness record once, after complete registration and
+            // peer acceptance have both been observed.
+            gst::info!(
+                CAT,
+                "native sender ready namespace={} draft={}",
+                ready_ns,
+                ep.negotiated_draft()
+            );
             Ok((sender, handles))
         })();
-        let sender = match started {
-            Ok((sender, tracks)) => {
-                for (pad, track) in pads.iter().zip(tracks) {
-                    let _st = self.obj_lock();
-                    pad.set_track(Some(track));
-                }
-                sender
-            }
-            Err(rc) => {
-                // The last handle: stopping completes a queued startup task
-                // with no session before the endpoint goes.
+        let (sender, handles) = match started {
+            Ok(ready) => ready,
+            Err(failure) => {
+                // Dropping startup/sender inside the closure settles their
+                // work before the last application endpoint handle is dropped.
                 drop(ep);
-                gst::element_imp_error!(
-                    self,
-                    gst::ResourceError::OpenWrite,
-                    (
-                        "could not prepare MoQ sender (rc={}){}",
-                        rc,
-                        if cp_count > 0 {
-                            " -- check drm-systems: a systemID must be a \"8-4-4-4-12\" UUID string"
-                        } else {
-                            ""
-                        }
-                    )
-                );
-                *self.namespace.lock().unwrap() = None;
-                return false;
+                return self.fail_startup(ts, generation, failure);
             }
         };
         if cp_count > 0 {
@@ -2197,9 +2409,15 @@ impl MoqSink {
         }
         {
             let mut send = self.send_lock();
+            let mut st = self.obj_lock();
+            if st.state_flushing || st.flush_count > 0 || st.flush_generation != generation {
+                return Err(gst::FlowError::Flushing);
+            }
+            for (pad, track) in pads.iter().zip(handles) {
+                pad.set_track(Some(track));
+            }
             send.sender = Some(sender);
             send.sender_generation += 1;
-            let mut st = self.obj_lock();
             ep.set_interrupted(st.state_flushing || st.flush_count > 0);
             st.ep = Some(ep);
         }
@@ -2213,7 +2431,7 @@ impl MoqSink {
             s.port,
             s.relay_path
         );
-        true
+        Ok(())
     }
 
     fn stop(&self) {
@@ -2281,7 +2499,7 @@ impl ObjectSubclass for MoqSink {
 impl ObjectImpl for MoqSink {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
-            vec![
+            Vec::from(crate::auth::properties()).into_iter().chain(vec![
                 glib::ParamSpecString::builder("host")
                     .nick("Host")
                     .blurb("MoQ relay host to connect to")
@@ -2331,11 +2549,11 @@ impl ObjectImpl for MoqSink {
                 glib::ParamSpecUInt::builder("draft")
                     .nick("MoQT draft")
                     .blurb(
-                        "MoQ Transport draft version to negotiate (16 or 18); \
-                         0 offers every draft libmoq supports",
+                        "MoQ Transport draft version to negotiate (16, 18 or 22); \
+                         0 negotiates supported drafts newest first (22, 18, 16)",
                     )
                     .minimum(0)
-                    .maximum(18)
+                    .maximum(22)
                     .default_value(DEFAULT_DRAFT)
                     .build(),
                 glib::ParamSpecBoolean::builder("sync")
@@ -2345,7 +2563,7 @@ impl ObjectImpl for MoqSink {
                     .build(),
                 glib::ParamSpecBoolean::builder("sap-timeline")
                     .nick("SAP timeline")
-                    .blurb("Publish a CMSF SAP event timeline track for every CMAF track")
+                    .blurb("Request a CMSF SAP event timeline; rejected when exact SAP classification is unavailable")
                     .default_value(false)
                     .build(),
                 glib::ParamSpecBoolean::builder("publish-tracks")
@@ -2424,7 +2642,7 @@ impl ObjectImpl for MoqSink {
                     .maximum(u32::MAX as u64)
                     .default_value(DEFAULT_MAX_FRAGMENT)
                     .build(),
-            ]
+            ]).collect()
         });
         PROPS.as_ref()
     }
@@ -2440,7 +2658,20 @@ impl ObjectImpl for MoqSink {
                 .set_property_from_value(pspec.name(), value),
             name => {
                 let mut s = self.settings.lock().unwrap();
+                if matches!(pspec.name(), "setup-auth-token" | "setup-auth-token-type")
+                    && !crate::auth::can_mutate(self.obj().as_ref())
+                {
+                    drop(s);
+                    gst::error!(
+                        CAT,
+                        imp = self,
+                        "SETUP authorization properties require NULL or READY state"
+                    );
+                    return;
+                }
                 match name {
+                    "setup-auth-token" => s.auth.encoded = string(),
+                    "setup-auth-token-type" => s.auth.token_type = value.get().unwrap(),
                     "host" => s.host = string().unwrap_or_default(),
                     "port" => s.port = value.get().unwrap(),
                     "relay-path" => s.relay_path = string().unwrap_or_default(),
@@ -2468,6 +2699,7 @@ impl ObjectImpl for MoqSink {
         }
         let s = self.settings.lock().unwrap();
         match pspec.name() {
+            "setup-auth-token-type" => s.auth.token_type.to_value(),
             "host" => s.host.to_value(),
             "port" => s.port.to_value(),
             "relay-path" => s.relay_path.to_value(),
@@ -2581,22 +2813,21 @@ impl ElementImpl for MoqSink {
         &self,
         transition: gst::StateChange,
     ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+        #[cfg(test)]
+        if transition == gst::StateChange::ReadyToPaused {
+            crate::auth::interleave::before_start();
+        }
         match transition {
-            gst::StateChange::NullToReady => {
-                if !self.start() {
-                    return Err(gst::StateChangeError);
-                }
-            }
-            gst::StateChange::ReadyToPaused => {
-                if !self.started() && !self.start() {
-                    return Err(gst::StateChangeError);
-                }
+            gst::StateChange::NullToReady if !self.start() => return Err(gst::StateChangeError),
+            gst::StateChange::ReadyToPaused if !self.started() && !self.start() => {
+                return Err(gst::StateChangeError)
             }
             gst::StateChange::PausedToReady => {
                 let pads = self.sink_pads();
                 {
                     let mut st = self.obj_lock();
                     st.state_flushing = true;
+                    st.flush_generation += 1;
                     for p in &pads {
                         p.set_flushing(true);
                         if let Some(id) = p.clock_id().as_ref() {
@@ -2631,11 +2862,7 @@ impl ElementImpl for MoqSink {
                     ep.set_interrupted(st.flush_count > 0);
                 }
             }
-            gst::StateChange::PausedToReady => {
-                if ret.is_ok() {
-                    self.stop();
-                }
-            }
+            gst::StateChange::PausedToReady if ret.is_ok() => self.stop(),
             gst::StateChange::ReadyToNull => self.stop(),
             _ => {}
         }

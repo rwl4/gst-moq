@@ -12,6 +12,7 @@ pub fn relay_url(host: &str, port: u32, relay_path: &str) -> String {
 /// libmoq's own builder.
 pub(crate) fn endpoint_config(url: &str, insecure: bool, draft: u32) -> EndpointCfg {
     EndpointCfg {
+        setup_auth: None,
         url: url.to_owned(),
         insecure,
         draft,

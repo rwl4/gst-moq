@@ -40,3 +40,62 @@ pub unsafe fn bytes<'a>(b: moq5::sys::moq_bytes_t) -> &'a [u8] {
         std::slice::from_raw_parts(b.data, b.len)
     }
 }
+
+/// Return a fixture-owned element to NULL before releasing serial ownership.
+#[must_use = "keep cleanup alive until all fixture activity has settled"]
+pub(crate) struct NullCleanup(gst::Element);
+
+impl NullCleanup {
+    pub(crate) fn new(element: &impl gst::prelude::IsA<gst::Element>) -> Self {
+        use gst::prelude::*;
+        Self(element.clone().upcast())
+    }
+}
+
+impl Drop for NullCleanup {
+    fn drop(&mut self) {
+        use gst::prelude::*;
+        // A fixture may be unwinding while its streaming worker is parked
+        // inside the private attach hold and owns the track lock. Release
+        // that test-only hold before NULL waits for streaming to settle.
+        crate::service::fake::release_attach();
+        if let Err(error) = self.0.set_state(gst::State::Null) {
+            if std::thread::panicking() {
+                eprintln!("WARNING: fixture NULL cleanup failed while unwinding: {error}");
+            } else {
+                panic!("fixture NULL cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+/// Remove a fixture log callback and restore its threshold during unwinding.
+#[must_use = "keep log cleanup alive until the fixture has finished logging"]
+pub(crate) struct LogCleanup {
+    handle: Option<gst::log::DebugLogFunction>,
+    category: gst::DebugCategory,
+    previous: gst::DebugLevel,
+}
+
+impl LogCleanup {
+    pub(crate) fn new(
+        handle: gst::log::DebugLogFunction,
+        category: gst::DebugCategory,
+        previous: gst::DebugLevel,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            category,
+            previous,
+        }
+    }
+}
+
+impl Drop for LogCleanup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            gst::log::remove_log_function(handle);
+        }
+        self.category.set_threshold(self.previous);
+    }
+}

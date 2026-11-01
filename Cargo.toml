@@ -9,7 +9,7 @@ edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
 description = "Media over QUIC elements backed by MOQ5"
-repository = "https://github.com/openmoq/moq5"
+repository = "https://github.com/rwl4/gst-moq"
 
 [lib]
 name = "gstmoq"
@@ -25,11 +25,7 @@ path = "src/bin/inspect_cmaf_fixture.rs"
 gst = { package = "gstreamer", version = "0.25", features = ["v1_22"] }
 gst-base = { package = "gstreamer-base", version = "0.25", features = ["v1_22"] }
 # The Rust bindings live in moq5 (bindings/rust); pinned to a commit.
-moq5 = { git = "https://github.com/openmoq/moq5", rev = "2a305fc7158c47501391d6f59774b157e215df13" }
-
-[dev-dependencies]
-# The fake-libmoq seam the unit tests install.
-moq5 = { git = "https://github.com/openmoq/moq5", rev = "2a305fc7158c47501391d6f59774b157e215df13"  }
+moq5 = { git = "https://github.com/openmoq/moq5", rev = "f81a6188741877bd93aa7771181b9bf995d6cc65" }
 
 [profile.release]
 lto = "thin"

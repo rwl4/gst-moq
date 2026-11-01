@@ -11,13 +11,13 @@
 //! test takes [`suite`] first: it serialises against the other tests and
 //! resets the control block.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use moq5::{
     ContentProtection, Error, MediaType, Packaging, Result, SendObject, SenderStats,
-    SubscribeOptions, TerminalReason, TrackEventKind, WaitResult, WriteError,
+    SubscribeOptions, TerminalReason, TrackEventKind, WaitResult,
 };
 
 use super::{EndpointCfg, ReceiverCfg, SenderCfg, TerminalInfo, TrackCfg};
@@ -39,10 +39,12 @@ pub(crate) enum Op {
     /// A marker the test places to order its own steps against the element's.
     Mark,
     Connect,
+    Post,
     Attach,
     AddTrack,
     Write,
     EndTrack,
+    Complete,
     Drain,
     Interrupt,
     Subscribe,
@@ -83,6 +85,8 @@ pub(crate) struct Event {
     pub(crate) kind: TrackEventKind,
     /// The code `raw_kind` reports, for the kinds this crate only logs.
     pub(crate) raw_kind: u32,
+    pub(crate) local_result: Option<Error>,
+    pub(crate) delivery_origin: Option<moq5::DeliveryOrigin>,
     pub(crate) track: Option<Track>,
     pub(crate) desc: Option<DescData>,
 }
@@ -115,6 +119,9 @@ pub(crate) struct Control {
     // -- sender
     /// Refuse `Sender::attach` with NOMEM.
     pub(crate) fail_attach: bool,
+    pub(crate) fail_post: bool,
+    pub(crate) hold_startup: bool,
+    pub(crate) startup_queued: bool,
     /// Refuse the Nth (1-based) `add_track`; 0 refuses none.
     pub(crate) fail_add: u32,
     pub(crate) added_tracks: u32,
@@ -124,13 +131,16 @@ pub(crate) struct Control {
     /// `is_ready` answers false for this many calls, then true.
     pub(crate) not_ready_for: u32,
     pub(crate) ready_calls: u32,
+    pub(crate) sender_wait_error: Option<Error>,
     pub(crate) writes: u32,
+    pub(crate) written_sap: Vec<(bool, bool, Option<moq5::SapType>)>,
     pub(crate) ends: u32,
     pub(crate) refusals: u32,
     /// Refuse the next `write` with WOULD_BLOCK this many times.
     pub(crate) refuse_writes: u32,
     /// Refuse the next `end_track` with WOULD_BLOCK this many times.
     pub(crate) refuse_ends: u32,
+    pub(crate) complete_result: Option<Error>,
     pub(crate) ended: [bool; 16],
     pub(crate) stats: SenderStats,
     pub(crate) sender_fatal: Option<u64>,
@@ -145,7 +155,10 @@ pub(crate) struct Control {
     pub(crate) connects: u32,
     /// What the element dialled, for the draft/verification assertions.
     pub(crate) dialled: Option<EndpointCfg>,
+    pub(crate) version_offer: Option<moq5::VersionOffer>,
+    pub(crate) setup_auth: Vec<moq5::AuthToken>,
     pub(crate) connect_result: Option<Error>,
+    pub(crate) on_connect: Option<Box<dyn FnMut() + Send>>,
     pub(crate) receiver_cfg: Option<ReceiverCfg>,
     pub(crate) receiver_attach_result: Option<Error>,
     pub(crate) drains: u32,
@@ -172,6 +185,8 @@ pub(crate) struct Control {
     pub(crate) waits: u32,
     /// An unexpected wait is a quick failure unless a test wants otherwise.
     pub(crate) wait_result: Option<Error>,
+    pub(crate) track_poll_error: Option<Error>,
+    pub(crate) description_error: Option<Error>,
     pub(crate) cleaned: u32,
     pub(crate) subscriptions: u32,
     pub(crate) subscribed_track: Option<Track>,
@@ -190,17 +205,23 @@ impl Control {
     fn new() -> Control {
         Control {
             fail_attach: false,
+            fail_post: false,
+            hold_startup: false,
+            startup_queued: false,
             fail_add: 0,
             added_tracks: 0,
             hold_attach: false,
             attach_entered: false,
             not_ready_for: 0,
             ready_calls: 0,
+            sender_wait_error: None,
             writes: 0,
+            written_sap: Vec::new(),
             ends: 0,
             refusals: 0,
             refuse_writes: 0,
             refuse_ends: 0,
+            complete_result: None,
             ended: [false; 16],
             stats: SenderStats::default(),
             sender_fatal: None,
@@ -213,7 +234,10 @@ impl Control {
             budget: 0,
             connects: 0,
             dialled: None,
+            version_offer: None,
+            setup_auth: Vec::new(),
             connect_result: None,
+            on_connect: None,
             receiver_cfg: None,
             receiver_attach_result: None,
             drains: 0,
@@ -231,6 +255,8 @@ impl Control {
             object_index: 0,
             waits: 0,
             wait_result: Some(Error::INTERRUPTED),
+            track_poll_error: None,
+            description_error: None,
             cleaned: 0,
             subscriptions: 0,
             subscribed_track: None,
@@ -245,6 +271,9 @@ impl Control {
 }
 
 static CONTROL: Mutex<Option<Control>> = Mutex::new(None);
+// Accounting only: SERIAL remains the sole fixture coordinator. A new suite
+// cannot discard state while an endpoint/sender/receiver/object still exists.
+static LIVE_OWNERS: AtomicUsize = AtomicUsize::new(0);
 static COND: Condvar = Condvar::new();
 static RELEASED: AtomicBool = AtomicBool::new(false);
 
@@ -277,11 +306,26 @@ pub(crate) struct Suite(
     /// Held, not read: it serialises this test against the others.
     #[allow(dead_code)]
     MutexGuard<'static, ()>,
+    Option<Box<dyn FnOnce()>>,
 );
+
+impl Suite {
+    /// Observe the actual fixture immediately before its serial guard releases.
+    pub(crate) fn observe_before_release(&mut self, observe: impl FnOnce() + 'static) {
+        self.1 = Some(Box::new(observe));
+    }
+}
 
 impl Drop for Suite {
     fn drop(&mut self) {
-        *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if LIVE_OWNERS.load(Ordering::SeqCst) == 0 {
+            *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        } else {
+            eprintln!("WARNING: fake suite ended with surviving service owners");
+        }
+        if let Some(observe) = self.1.take() {
+            observe();
+        }
     }
 }
 
@@ -289,10 +333,25 @@ pub(crate) fn suite() -> Suite {
     // The shared serial lock: it also initialises GStreamer, and the clock
     // seam's users take the same one.
     let serial = crate::test_support::serial();
-    LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    assert_eq!(
+        LIVE_OWNERS.load(Ordering::SeqCst),
+        0,
+        "prior fake owners did not settle"
+    );
+    {
+        let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+        log.clear();
+        LOG.clear_poison();
+    }
     RELEASED.store(false, Ordering::SeqCst);
-    *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Control::new());
-    Suite(serial)
+    {
+        let mut state = CONTROL.lock().unwrap_or_else(|e| e.into_inner());
+        *state = Some(Control::new());
+        // Recovery is restricted to this exclusive reset, after old owners
+        // have settled and fresh fixture state has been installed.
+        CONTROL.clear_poison();
+    }
+    Suite(serial, None)
 }
 
 /// Let an `attach` held by `hold_attach` proceed.
@@ -314,22 +373,32 @@ pub(crate) fn wait_attach_entered() {
 /// A handle on the endpoint. `moq5::Endpoint` is refcounted, so cloning it
 /// does not open a second one and only the last handle tears it down -- the
 /// restart case counts exactly one teardown across the element's clones.
-#[derive(Clone, Debug)]
-pub(crate) struct Endpoint(Arc<()>);
+#[derive(Debug)]
+pub(crate) struct Endpoint(Arc<EndpointOwner>);
 
-impl Drop for Endpoint {
+impl Clone for Endpoint {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+#[derive(Debug)]
+struct EndpointOwner;
+
+impl Drop for EndpointOwner {
     /// `moq5::Endpoint`'s own drop stops and destroys the endpoint when the
     /// last handle goes; the startup tests assert that call order.
     fn drop(&mut self) {
-        if Arc::strong_count(&self.0) > 1 {
-            return;
+        // Keep accounting during controlled Rust unwinding without clearing
+        // poison. Only suite() may reset poisoned fixture state.
+        let mut guard = CONTROL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = guard.as_mut() {
+            c.destroys += 1;
+            c.startup_calls.push_str("stop;destroy;");
+        } else {
+            eprintln!("WARNING: fake endpoint outlived its suite");
         }
-        if let Ok(mut guard) = CONTROL.lock() {
-            if let Some(c) = guard.as_mut() {
-                c.destroys += 1;
-                c.startup_calls.push_str("stop;destroy;");
-            }
-        }
+        LIVE_OWNERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -338,11 +407,22 @@ impl Endpoint {
         let mut c = control();
         c.connects += 1;
         c.dialled = Some(config.clone());
+        c.version_offer = Some(super::real::version_offer(config.draft));
+        c.setup_auth = super::real::setup_auth_tokens(config);
         c.startup_calls.push_str("connect;");
         log_add(Op::Connect, None);
-        match c.connect_result {
+        let result = c.connect_result;
+        let hook = c.on_connect.take();
+        drop(c);
+        if let Some(mut hook) = hook {
+            hook();
+        }
+        match result {
             Some(e) => Err(e),
-            None => Ok(Endpoint(Arc::new(()))),
+            None => {
+                LIVE_OWNERS.fetch_add(1, Ordering::SeqCst);
+                Ok(Endpoint(Arc::new(EndpointOwner)))
+            }
         }
     }
 
@@ -365,6 +445,10 @@ impl Endpoint {
             return Err(Error::INTERRUPTED);
         }
         c.drain_result.unwrap_or(Ok(WaitResult::Ready))
+    }
+
+    pub(crate) fn negotiated_draft(&self) -> u32 {
+        control().negotiated_draft
     }
 
     pub(crate) fn set_interrupted(&self, interrupted: bool) {
@@ -405,10 +489,32 @@ pub(crate) struct Sender;
 impl Drop for Sender {
     fn drop(&mut self) {
         log_add(Op::DestroySender, None);
+        LIVE_OWNERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl Sender {
+    pub(crate) fn attach_with_tracks(
+        endpoint: &Endpoint,
+        config: &SenderCfg,
+        tracks: &[TrackCfg],
+    ) -> Result<SenderStartup> {
+        if tracks.is_empty() {
+            return Err(Error::INVAL);
+        }
+        log_add(Op::Post, None);
+        if control().fail_post {
+            return Err(Error::CLOSED);
+        }
+        control().startup_queued = true;
+        COND.notify_all();
+        Ok(SenderStartup {
+            endpoint: endpoint.clone(),
+            config: Some(config.clone()),
+            tracks: tracks.to_vec(),
+        })
+    }
+
     pub(crate) fn attach(_endpoint: &Endpoint, config: &SenderCfg) -> Result<Sender> {
         {
             let mut c = control();
@@ -427,6 +533,7 @@ impl Sender {
         if control().fail_attach {
             return Err(Error::NOMEM);
         }
+        LIVE_OWNERS.fetch_add(1, Ordering::SeqCst);
         Ok(Sender)
     }
 
@@ -445,40 +552,26 @@ impl Sender {
         Ok(SendTrack(index))
     }
 
-    pub(crate) fn write(
-        &self,
-        track: SendTrack,
-        object: SendObject,
-    ) -> std::result::Result<(), WriteError> {
+    pub(crate) fn write(&self, track: SendTrack, object: SendObject) -> Result<()> {
         let mut c = control();
         if c.interrupted {
-            return Err(WriteError {
-                error: Error::INTERRUPTED,
-                object,
-            });
+            return Err(Error::INTERRUPTED);
         }
         if c.refuse_writes > 0 {
             c.refuse_writes -= 1;
             c.refusals += 1;
-            return Err(WriteError {
-                error: Error::WOULD_BLOCK,
-                object,
-            });
+            return Err(Error::WOULD_BLOCK);
         }
         // Writing an ended track is the state error libmoq reports.
         if c.ended.get(track.0).copied().unwrap_or(false) {
-            return Err(WriteError {
-                error: Error::WRONG_STATE,
-                object,
-            });
+            return Err(Error::WRONG_STATE);
         }
         if track.0 >= c.track_names.len() {
-            return Err(WriteError {
-                error: Error::INVAL,
-                object,
-            });
+            return Err(Error::INVAL);
         }
         c.writes += 1;
+        c.written_sap
+            .push((object.is_sync, object.starts_group, object.sap_type));
         // The LOC timing the barrier suite asserts: the capture timestamp per
         // media kind, and how often an audio object opened a group.
         let audio = c
@@ -519,8 +612,20 @@ impl Sender {
         Ok(())
     }
 
+    pub(crate) fn complete(&self) -> Result<()> {
+        let c = control();
+        log_add(Op::Complete, None);
+        if c.interrupted {
+            return Err(Error::INTERRUPTED);
+        }
+        match c.complete_result {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn stats(&self) -> Result<SenderStats> {
-        Ok(control().stats.clone())
+        Ok(control().stats)
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -538,22 +643,72 @@ impl Sender {
     }
 
     pub(crate) fn wait(&self, _timeout: Duration) -> Result<WaitResult> {
+        let hook = control().on_wait.take();
+        if let Some(mut hook) = hook {
+            hook();
+            control().on_wait = Some(hook);
+        }
+        let c = control();
+        if c.interrupted {
+            return Err(Error::INTERRUPTED);
+        }
+        if let Some(error) = c.sender_wait_error {
+            return Err(error);
+        }
         Ok(WaitResult::Ready)
+    }
+}
+
+pub(crate) struct SenderStartup {
+    endpoint: Endpoint,
+    config: Option<SenderCfg>,
+    tracks: Vec<TrackCfg>,
+}
+
+impl SenderStartup {
+    pub(crate) fn poll(&mut self) -> Result<Option<(Sender, Vec<SendTrack>)>> {
+        if control().hold_startup {
+            return Ok(None);
+        }
+        let config = self.config.take().ok_or(Error::WRONG_STATE)?;
+        let sender = Sender::attach(&self.endpoint, &config)?;
+        let handles = self
+            .tracks
+            .iter()
+            .map(|track| sender.add_track(track))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((sender, handles)))
+    }
+}
+
+pub(crate) fn wait_startup_queued() {
+    let mut guard = CONTROL.lock().unwrap();
+    while !guard.as_ref().is_some_and(|c| c.startup_queued) {
+        guard = COND.wait(guard).unwrap();
     }
 }
 
 // -- receiver ---------------------------------------------------------------
 
 #[derive(Debug)]
-pub(crate) struct Receiver;
+pub(crate) struct Receiver {
+    _owner: (),
+}
 
 impl Drop for Receiver {
     fn drop(&mut self) {
         log_add(Op::DestroyReceiver, None);
+        LIVE_OWNERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl Receiver {
+    /// A receiver installed directly by source fixtures, with normal ownership.
+    pub(crate) fn fixture() -> Self {
+        LIVE_OWNERS.fetch_add(1, Ordering::SeqCst);
+        Receiver { _owner: () }
+    }
+
     pub(crate) fn attach(_endpoint: &Endpoint, config: &ReceiverCfg) -> Result<Receiver> {
         let mut c = control();
         c.receiver_cfg = Some(config.clone());
@@ -561,7 +716,7 @@ impl Receiver {
         log_add(Op::Attach, None);
         match c.receiver_attach_result {
             Some(e) => Err(e),
-            None => Ok(Receiver),
+            None => Ok(Receiver::fixture()),
         }
     }
 
@@ -583,6 +738,9 @@ impl Receiver {
 
     pub(crate) fn poll_track(&self) -> Result<Option<TrackEvt<'_>>> {
         let mut c = control();
+        if let Some(error) = c.track_poll_error {
+            return Err(error);
+        }
         if c.event_index >= c.events.len() {
             return Ok(None);
         }
@@ -604,7 +762,8 @@ impl Receiver {
         }
         let o = c.objects[c.object_index].clone();
         c.object_index += 1;
-        Ok(Some(Object(o)))
+        LIVE_OWNERS.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(Object(o, std::marker::PhantomData)))
     }
 
     pub(crate) fn wait(&self, _timeout: Duration) -> Result<WaitResult> {
@@ -637,6 +796,12 @@ pub(crate) struct TrackEvt<'r> {
 }
 
 impl<'r> TrackEvt<'r> {
+    pub(crate) fn local_result(&self) -> Option<Error> {
+        self.event.local_result
+    }
+    pub(crate) fn delivery_origin(&self) -> Option<moq5::DeliveryOrigin> {
+        self.event.delivery_origin
+    }
     pub(crate) fn kind(&self) -> TrackEventKind {
         self.event.kind
     }
@@ -644,6 +809,9 @@ impl<'r> TrackEvt<'r> {
         self.event.track
     }
     pub(crate) fn description(&self) -> Result<Option<Desc<'r>>> {
+        if let Some(error) = control().description_error {
+            return Err(error);
+        }
         Ok(self.event.desc.clone().map(|d| Desc {
             data: d,
             _receiver: std::marker::PhantomData,
@@ -686,15 +854,17 @@ impl<'r> Desc<'r> {
     }
 }
 
-pub(crate) struct Object(ObjectData);
+pub(crate) struct Object(ObjectData, std::marker::PhantomData<std::rc::Rc<()>>);
 
 impl Drop for Object {
     fn drop(&mut self) {
-        if let Ok(mut guard) = CONTROL.lock() {
-            if let Some(c) = guard.as_mut() {
-                c.cleaned += 1;
-            }
+        let mut guard = CONTROL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = guard.as_mut() {
+            c.cleaned += 1;
+        } else {
+            eprintln!("WARNING: fake object outlived its suite");
         }
+        LIVE_OWNERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -719,3 +889,88 @@ impl Object {
     }
 }
 
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn owners() -> (Endpoint, Receiver, Object) {
+        let endpoint = Endpoint::connect(&EndpointCfg {
+            setup_auth: None,
+            url: "https://example.invalid/moq".into(),
+            insecure: false,
+            draft: 16,
+        })
+        .unwrap();
+        let receiver = Receiver::attach(
+            &endpoint,
+            &ReceiverCfg::live(moq5::Namespace::parse("fixture").unwrap()),
+        )
+        .unwrap();
+        control().objects.push(ObjectData::default());
+        let object = receiver.poll_object().unwrap().unwrap();
+        (endpoint, receiver, object)
+    }
+
+    fn cleanup_and_reset(poison: bool) {
+        {
+            let _suite = suite();
+            let (endpoint, receiver, object) = owners();
+            if poison {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let _control = control();
+                    panic!("controlled CONTROL poison");
+                }));
+                assert!(result.is_err());
+                assert!(CONTROL.is_poisoned());
+            }
+            let other = endpoint.clone();
+            drop(endpoint);
+            let early = control().destroys;
+            assert_eq!(early, 0);
+            drop(object);
+            drop(receiver);
+            drop(other);
+            let observed = {
+                let c = control();
+                (c.cleaned, c.destroys, c.startup_calls.clone())
+            };
+            assert_eq!(observed, (1, 1, "connect;attach;stop;destroy;".into()));
+            assert_eq!(LIVE_OWNERS.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                CONTROL.is_poisoned(),
+                poison,
+                "cleanup must not clear poison"
+            );
+        }
+        let _next = suite();
+        assert!(
+            !CONTROL.is_poisoned(),
+            "only the exclusive reset clears poison"
+        );
+        let empty = {
+            let c = control();
+            (c.cleaned, c.destroys)
+        };
+        assert_eq!(empty, (0, 0));
+        let (endpoint, receiver, object) = owners();
+        drop(object);
+        drop(receiver);
+        drop(endpoint);
+        let observed = {
+            let c = control();
+            (c.cleaned, c.destroys, c.startup_calls.clone())
+        };
+        assert_eq!(observed, (1, 1, "connect;attach;stop;destroy;".into()));
+        assert_eq!(LIVE_OWNERS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn healthy_cleanup_and_next_suite_reset() {
+        cleanup_and_reset(false);
+    }
+    #[test]
+    fn poisoned_control_cleanup_and_next_suite_reset() {
+        cleanup_and_reset(true);
+    }
+}

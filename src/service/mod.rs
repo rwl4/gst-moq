@@ -17,10 +17,12 @@
 //! changing underneath it.
 //!
 //! Types that libmoq hands back as plain data with public fields
-//! (`Terminal`, `SenderStats`, `WriteError`, `TrackEventKind`, the handles)
+//! (`SenderStats`, `TrackEventKind`, the handles)
 //! are `moq5`'s own, re-exported, because a double can build those directly.
 //! Only what `moq5` keeps opaque -- a track event, a media object, a track
 //! description -- gets a facade type here.
+//! A rejected native write returns ownership to the adapter, which releases
+//! that object on the calling thread and preserves its native error code.
 
 // Compiled in a test build too, so its signatures stay checked against the
 // elements even while the double is the one they call.
@@ -34,11 +36,15 @@ pub(crate) mod fake;
 // reach them through inference, and the fake build names more of them.
 #[allow(unused_imports)]
 #[cfg(not(test))]
-pub(crate) use real::{Desc, Endpoint, Object, Receiver, SendTrack, Sender, Track, TrackEvt};
+pub(crate) use real::{
+    Desc, Endpoint, Object, Receiver, SendTrack, Sender, SenderStartup, Track, TrackEvt,
+};
 
 #[allow(unused_imports)]
 #[cfg(test)]
-pub(crate) use fake::{Desc, Endpoint, Object, Receiver, SendTrack, Sender, Track, TrackEvt};
+pub(crate) use fake::{
+    Desc, Endpoint, Object, Receiver, SendTrack, Sender, SenderStartup, Track, TrackEvt,
+};
 
 // -- what the elements author ----------------------------------------------
 //
@@ -68,6 +74,7 @@ pub(crate) struct TerminalInfo {
 /// pinned the right draft or left certificate verification on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EndpointCfg {
+    pub(crate) setup_auth: Option<crate::auth::Token>,
     pub(crate) url: String,
     pub(crate) insecure: bool,
     /// The MoQT draft to offer exactly, or 0 to offer all.
@@ -206,11 +213,6 @@ impl TrackCfg {
     #[must_use]
     pub(crate) fn bitrate(mut self, bitrate: u64) -> TrackCfg {
         self.bitrate = Some(bitrate);
-        self
-    }
-    #[must_use]
-    pub(crate) fn sap_timeline(mut self, history_groups: u32) -> TrackCfg {
-        self.sap_timeline = Some(history_groups);
         self
     }
     #[must_use]

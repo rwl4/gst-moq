@@ -6,7 +6,24 @@
 //! reached. `smoke_guards` runs the socket-free controls for that script.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+
+/// Keep subprocess diagnostics in libtest's per-test capture, including on
+/// success. `--show-output` exposes them without interleaving result rows.
+fn report_output(label: &str, output: &Output) {
+    println!(
+        "{label} stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    eprintln!(
+        "{label} stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn fixture_python() -> std::ffi::OsString {
+    std::env::var_os("GST_MOQ_PYTHON").unwrap_or_else(|| "python3".into())
+}
 
 fn repo() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -22,6 +39,7 @@ fn built_plugin() -> PathBuf {
         cmd.arg("--release");
     }
     let out = cmd.output().expect("run cargo build");
+    report_output("cargo build --lib", &out);
     assert!(
         out.status.success(),
         "cargo build --lib failed:\n{}",
@@ -56,6 +74,7 @@ fn smoke() {
         .env("GST_REGISTRY", tmp.join("registry.bin"))
         .output()
         .expect("run tests/smoke.sh");
+    report_output("tests/smoke.sh", &out);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("smoke OK"),
@@ -73,9 +92,32 @@ fn smoke_guards() {
         .arg(repo().join("tests/test_smoke_guards.py"))
         .output()
         .expect("python3 is required for the smoke guard tests");
+    report_output("test_smoke_guards.py", &out);
     assert!(
         out.status.success(),
         "test_smoke_guards.py failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn fixture_publisher_links_at_null() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fixture-publisher");
+    std::fs::create_dir_all(&tmp).expect("create private fixture directory");
+    let plugin = built_plugin();
+    let out = Command::new(fixture_python())
+        .arg("-I")
+        .arg(repo().join("tests/test_fixture_publisher.py"))
+        .arg(plugin)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("GST_REGISTRY", tmp.join("registry.bin"))
+        .output()
+        .expect("Python with PyGObject is required; set GST_MOQ_PYTHON");
+    report_output("test_fixture_publisher.py", &out);
+    assert!(
+        out.status.success(),
+        "fixture construction failed:\n{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
